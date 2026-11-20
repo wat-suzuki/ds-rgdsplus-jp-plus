@@ -1,0 +1,61 @@
+CHANGE LOG
+
+- added manual state recovery
+- simplified design (boot logos and system menus)
+- fixed archive menu viewport paging
+
+----------------------------------------
+
+[ ] 
+
+----------------------------------------
+
+https://github.com/beebono/DSperate
+https://github.com/SapphireRhodonite/SeedlessDS-Core
+
+----------------------------------------
+
+I should move drastic.cfg into a blob 
+	to prevent tampering (which can break things)
+
+----------------------------------------
+
+drastic (17550db727f3b59d36b57746ad1944be) from: 
+	https://github.com/ROCKNIX/packages/blob/main/drastic.tar.gz
+
+----------------------------------------
+
+Look up program function (eg. Drastic's quit)
+
+	nm ./drastic | grep quit
+	0000000000089c70 T lua_quit
+	000000000008a110 T platform_quit
+	000000000000e8d0 T quit
+	000000000007a260 T select_quit
+
+then in Cutter find sym.quit, show Xrefs, and trace its args up through the call sites 
+
+----------------------------------------
+
+# Updating
+1. Download the `dedicated-rgds-plus` zip below and unzip.
+2. Copy `system.zip` to the root of your TF2/EXT SD card.
+3. Eject and insert the card back into the TF2/EXT slot.
+
+# Installing
+1. Download the latest [main-rgds-plus][main] image.
+2. Flash the image to a small SD card. Insert into the TF1/INT slot.
+3. Download the `dedicated-rgds-plus` zip below.
+4. Format a larger SD card as FAT32 (MBR not GPT).
+5. Unzip the downloaded zip file and copy its contents to the root of the freshly formatted SD card.
+6. Add your games and bios to the SD card (the games you won't be playing immediately can go in `/games/archive` to hide them for now). Insert into the TF2/EXT slot.
+
+[main]:https://github.com/dedicated-os/main-rgds-plus/releases/latest
+
+> [!NOTE]
+> Using two separate cards, one for the system and another for games and userdata, is the preferred setup. Using a single card is possible but not recommended.
+
+----------------------------------------
+
+> [!CAUTION]
+> This release is out of date. [Download the latest instead.](https://github.com/dedicated-os/dedicated-rgds-plus/releases/latest)
