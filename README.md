@@ -36,6 +36,8 @@ Press the device's **MENU** button to open the in-game menu. Press it again to o
 | Adjust brightness | `MENU + Volume + / Volume -` |
 | Fast-forward | `BACK` |
 
+![Boot controls](github/bootlogo-1-preview.png)
+
 Changing Hi-Res mode saves the current game, restarts DraStic, and resumes the game automatically.
 
 ## Credits

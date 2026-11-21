@@ -3,8 +3,9 @@
 BUILD_HASH:=$(shell git rev-parse --short HEAD)
 RELEASE_DIRT:=$(if $(shell git status --porcelain; git log @{upstream}..HEAD --oneline),-dirty,)
 RELEASE_TIME:=$(shell TZ=GMT date +%Y%m%d)
-RELEASE_BASE=ds-rgdsplus-jp-plus-$(RELEASE_TIME)
-RELEASE_DOT:=$(shell find ./releases/. -regex ".*/${RELEASE_BASE}-[0-9]+\(-dirty\)?\.zip" 2>/dev/null | wc -l | sed 's/ //g')
+RELEASE_PREFIX=ds-rgdsplus-jp+
+RELEASE_BASE=$(RELEASE_PREFIX)-$(RELEASE_TIME)
+RELEASE_DOT:=$(shell find ./releases/. -type f -name "$(RELEASE_BASE)-*.zip" 2>/dev/null | wc -l | sed 's/ //g')
 RELEASE_NAME=$(RELEASE_BASE)-$(RELEASE_DOT)$(RELEASE_DIRT)
 
 all: setup build package done
