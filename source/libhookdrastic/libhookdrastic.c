@@ -7,23 +7,48 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <setjmp.h>
 #include <dirent.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
 #include <alsa/asoundlib.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_opengles2.h>
+#define Font SDL_X11_Font
+#include <SDL2/SDL_syswm.h>
+#undef Font
 #include "xgl.h"
+#include "utf8.h"
+#include "avsystem.h"
+#include "avprobe.h"
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+static AVProfile av_profile;
+static AVSystem av_system;
+static int use_fused_grid = 1;
+static int use_grouped_present;
+
+/* These glibc entry points are hooked below, including non-fortified builds. */
+extern int __vprintf_chk(int, const char *, va_list);
+extern int __vsnprintf_chk(char *, size_t, int, size_t, const char *, va_list);
+extern int __vsprintf_chk(char *, int, size_t, const char *, va_list);
 
 // --------------------------------------------
 // XGL extensions
@@ -111,6 +136,28 @@ static void Paths_init(void) {
 
 #define DS_WIDTH 256
 #define DS_HEIGHT 192
+#define DRM_OVERLAY_BUFFERS 3
+
+typedef struct {
+	uint32_t handle, pitch, framebuffer;
+	uint64_t size;
+	void *pixels;
+} DrmOverlayBuffer;
+
+typedef struct {
+	int fd, enabled;
+	uint32_t crtc[SCREEN_COUNT], plane[SCREEN_COUNT];
+	uint32_t output_w[SCREEN_COUNT], output_h[SCREEN_COUNT];
+	uint32_t property[SCREEN_COUNT][10];
+	uint32_t zpos_property[SCREEN_COUNT];
+	uint64_t zpos_value[SCREEN_COUNT];
+	DrmOverlayBuffer buffers[SCREEN_COUNT][DRM_OVERLAY_BUFFERS];
+	unsigned next[SCREEN_COUNT];
+} DrmOverlay;
+
+static DrmOverlay drm_overlay = {.fd = -1};
+static int drm_overlay_requested;
+static int drm_overlay_mode;
 
 // --------------------------------------------
 
@@ -180,6 +227,15 @@ static void Paths_init(void) {
 typedef struct {
 	XGL_Texture *texture;
 	int claimed;
+	int width, height;
+	Uint32 format;
+	void *locked_pixels;
+	void *pixel_base;
+	int locked_pitch;
+	SDL_Rect locked_rect;
+	Uint64 pixels_started;
+	const void *completed_pixels;
+	int completed_pitch;
 } DummyTexture;
 
 typedef struct {
@@ -213,6 +269,9 @@ static struct {
 		XGL_Texture *meters;
 		XGL_Texture *notches;
 		XGL_Texture *grid;
+		XGL_Shader *game_shaders[SCREEN_COUNT];
+		int game_rgba_upload[SCREEN_COUNT];
+		int fused_grid_last[SCREEN_COUNT];
 	} xgl;
 	
 	SDL_Rect rects[SCREEN_COUNT];
@@ -230,6 +289,8 @@ static struct {
 	
 	char game_path[MAX_PATH];
 	char game_name[MAX_FILE];
+	char game_id[5];
+	int screen_swap;
 	
 	// TODO: why aren't these part of raw?
 	int bat;
@@ -251,12 +312,20 @@ static struct {
 	int preview_snap;
 	int battery;
 	int charging;
+	int screen_swap;
 	Uint32 status_at;
 } ui;
 
 static int osd_at;
 
 static int raw_x,raw_y; // touch screen fix
+
+static void Profile_suspend(void) {
+	if (!av_profile.enabled) return;
+	AVProfile_resetFrame(&av_profile);
+	AVProfile_pauseAudio(&av_profile, 1);
+	for (int i = 0; i < SCREEN_COUNT; i++) app.dummy.screens[i].pixels_started = 0;
+}
 
 // --------------------------------------------
 // support
@@ -401,6 +470,601 @@ static void raw_audio_init(void) {
 	raw_poll();
 }
 
+static void raw_drm_fourcc(uint32_t format, char out[5]) {
+	for (int i = 0; i < 4; i++) {
+		unsigned char c = (format >> (i * 8)) & 0xff;
+		out[i] = isprint(c) ? (char)c : '?';
+	}
+	out[4] = '\0';
+}
+
+static void raw_drm_report(int fd, drmModeRes *resources) {
+	if (!av_profile.detail || fd < 0 || !resources) return;
+	int universal = drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) == 0;
+	int atomic = drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+	uint64_t modifiers = 0, prime = 0;
+	int have_modifiers = drmGetCap(fd, DRM_CAP_ADDFB2_MODIFIERS, &modifiers) == 0;
+	int have_prime = drmGetCap(fd, DRM_CAP_PRIME, &prime) == 0;
+	SDL_Log("AV DRM: client_atomic=%d universal_planes=%d addfb2_modifiers=%s prime_import=%d prime_export=%d crtcs=%d connectors=%d",
+		atomic, universal, have_modifiers && modifiers ? "yes" : "no",
+		have_prime && (prime & DRM_PRIME_CAP_IMPORT) != 0,
+		have_prime && (prime & DRM_PRIME_CAP_EXPORT) != 0,
+		resources->count_crtcs, resources->count_connectors);
+
+	for (int i = 0; i < resources->count_connectors; i++) {
+		drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
+		if (!connector) continue;
+		uint32_t crtc_id = 0;
+		if (connector->encoder_id) {
+			drmModeEncoder *encoder = drmModeGetEncoder(fd, connector->encoder_id);
+			if (encoder) { crtc_id = encoder->crtc_id; drmModeFreeEncoder(encoder); }
+		}
+		char mode[64] = "none";
+		if (crtc_id) {
+			drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
+			if (crtc) {
+				if (crtc->mode_valid)
+					snprintf(mode, sizeof(mode), "%ux%u@%u", crtc->mode.hdisplay,
+						crtc->mode.vdisplay, crtc->mode.vrefresh);
+				drmModeFreeCrtc(crtc);
+			}
+		}
+		if (!strcmp(mode, "none") && connector->count_modes > 0)
+			snprintf(mode, sizeof(mode), "available:%ux%u@%u", connector->modes[0].hdisplay,
+				connector->modes[0].vdisplay, connector->modes[0].vrefresh);
+		SDL_Log("AV DRM: connector=%u type=%u connection=%s encoder=%u crtc=%u mode=%s modes=%d",
+			connector->connector_id, connector->connector_type,
+			connector->connection == DRM_MODE_CONNECTED ? "connected" :
+			connector->connection == DRM_MODE_DISCONNECTED ? "disconnected" : "unknown",
+			connector->encoder_id, crtc_id, mode, connector->count_modes);
+		drmModeFreeConnector(connector);
+	}
+
+	drmModePlaneRes *planes = drmModeGetPlaneResources(fd);
+	if (!planes) {
+		SDL_Log("AV DRM: plane enumeration unavailable: %s", strerror(errno));
+		return;
+	}
+	for (uint32_t i = 0; i < planes->count_planes; i++) {
+		drmModePlane *plane = drmModeGetPlane(fd, planes->planes[i]);
+		if (!plane) continue;
+		char possible[128] = "", formats[256] = "";
+		size_t possible_used = 0, formats_used = 0;
+		for (int c = 0; c < resources->count_crtcs; c++) {
+			if (!(plane->possible_crtcs & (1u << c))) continue;
+			int n = snprintf(possible + possible_used, sizeof(possible) - possible_used,
+				"%s%u", possible_used ? "," : "", resources->crtcs[c]);
+			if (n > 0 && (size_t)n < sizeof(possible) - possible_used) possible_used += (size_t)n;
+		}
+		for (uint32_t f = 0; f < plane->count_formats; f++) {
+			char fourcc[5];
+			raw_drm_fourcc(plane->formats[f], fourcc);
+			int n = snprintf(formats + formats_used, sizeof(formats) - formats_used,
+				"%s%s", formats_used ? "," : "", fourcc);
+			if (n > 0 && (size_t)n < sizeof(formats) - formats_used) formats_used += (size_t)n;
+			else break;
+		}
+		char type[24] = "unknown", src_w[48] = "unknown", dst_w[48] = "unknown";
+		uint32_t in_formats_blob = 0;
+		drmModeObjectProperties *properties = drmModeObjectGetProperties(fd, plane->plane_id,
+			DRM_MODE_OBJECT_PLANE);
+		if (properties) {
+			for (uint32_t p = 0; p < properties->count_props; p++) {
+				drmModePropertyRes *property = drmModeGetProperty(fd, properties->props[p]);
+				if (!property) continue;
+				if (strcmp(property->name, "type") == 0) {
+					for (int e = 0; e < property->count_enums; e++)
+						if (property->enums[e].value == properties->prop_values[p])
+							snprintf(type, sizeof(type), "%s", property->enums[e].name);
+				} else if (strcmp(property->name, "IN_FORMATS") == 0) {
+					in_formats_blob = (uint32_t)properties->prop_values[p];
+				} else if (strcmp(property->name, "SRC_W") == 0 && property->count_values >= 2) {
+					snprintf(src_w, sizeof(src_w), "%llu..%llu/65536",
+						(unsigned long long)property->values[0], (unsigned long long)property->values[1]);
+				} else if (strcmp(property->name, "CRTC_W") == 0 && property->count_values >= 2) {
+					snprintf(dst_w, sizeof(dst_w), "%llu..%llu",
+						(unsigned long long)property->values[0], (unsigned long long)property->values[1]);
+				}
+				drmModeFreeProperty(property);
+			}
+			drmModeFreeObjectProperties(properties);
+		}
+		SDL_Log("AV DRM: plane=%u type=%s possible_crtcs=%s formats=%s in_formats_blob=%u src_w=%s dst_w=%s",
+			plane->plane_id, type, possible[0] ? possible : "none",
+			formats[0] ? formats : "none", in_formats_blob, src_w, dst_w);
+		drmModeFreePlane(plane);
+	}
+	drmModeFreePlaneResources(planes);
+}
+
+static uint32_t raw_drm_property_id(int fd, uint32_t object_id, uint32_t object_type,
+		const char *name, uint64_t *value) {
+	drmModeObjectProperties *properties = drmModeObjectGetProperties(fd, object_id, object_type);
+	if (!properties) return 0;
+	uint32_t id = 0;
+	for (uint32_t i = 0; i < properties->count_props; i++) {
+		drmModePropertyRes *property = drmModeGetProperty(fd, properties->props[i]);
+		if (!property) continue;
+		if (strcmp(property->name, name) == 0) {
+			id = property->prop_id;
+			if (value) *value = properties->prop_values[i];
+			drmModeFreeProperty(property);
+			break;
+		}
+		drmModeFreeProperty(property);
+	}
+	drmModeFreeObjectProperties(properties);
+	return id;
+}
+
+static int raw_drm_plane_has_type(int fd, uint32_t plane_id, const char *type_name) {
+	uint64_t type_value = 0;
+	uint32_t type_id = raw_drm_property_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "type", &type_value);
+	if (!type_id) return 0;
+	drmModePropertyRes *property = drmModeGetProperty(fd, type_id);
+	if (!property) return 0;
+	int overlay = 0;
+	for (int i = 0; i < property->count_enums; i++) {
+		if (property->enums[i].value == type_value && strcmp(property->enums[i].name, type_name) == 0) {
+			overlay = 1;
+			break;
+		}
+	}
+	drmModeFreeProperty(property);
+	return overlay;
+}
+
+static int raw_drm_get_zpos(int fd, uint32_t plane_id, uint32_t *property_id,
+		uint64_t *current, uint64_t *minimum, uint64_t *maximum, int *immutable) {
+	drmModeObjectProperties *properties = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+	if (!properties) return 0;
+	int found = 0;
+	for (uint32_t i = 0; i < properties->count_props; i++) {
+		drmModePropertyRes *property = drmModeGetProperty(fd, properties->props[i]);
+		if (!property) continue;
+		if (strcmp(property->name, "zpos") == 0) {
+			*property_id = property->prop_id;
+			*current = properties->prop_values[i];
+			*immutable = (property->flags & DRM_MODE_PROP_IMMUTABLE) != 0;
+			if (property->count_values >= 2) {
+				*minimum = property->values[0];
+				*maximum = property->values[1];
+			}
+			found = 1;
+			drmModeFreeProperty(property);
+			break;
+		}
+		drmModeFreeProperty(property);
+	}
+	drmModeFreeObjectProperties(properties);
+	return found;
+}
+
+static int raw_drm_plane_is_overlay(int fd, uint32_t plane_id) {
+	return raw_drm_plane_has_type(fd, plane_id, "Overlay");
+}
+
+static int raw_drm_create_dumb_buffer(int fd, uint32_t width, uint32_t height, uint32_t bpp,
+		uint32_t *handle, uint32_t *pitch, uint64_t *size) {
+	struct drm_mode_create_dumb create = {0};
+	create.width = width;
+	create.height = height;
+	create.bpp = bpp;
+	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) return -1;
+	*handle = create.handle;
+	*pitch = create.pitch;
+	*size = create.size;
+	return 0;
+}
+
+static int raw_drm_destroy_dumb_buffer(int fd, uint32_t handle) {
+	struct drm_mode_destroy_dumb destroy = {.handle = handle};
+	return ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+}
+
+/* Validate dual-CRTC 2x scanout without changing the current display state. */
+static void raw_drm_test_dual_overlay(int fd, drmModeRes *resources) {
+	if (!av_profile.detail || fd < 0 || !resources) return;
+	if (drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
+		SDL_Log("AV DRM test: skipped; atomic client capability unavailable: %s", strerror(errno));
+		return;
+	}
+	uint32_t crtcs[2] = {0}, widths[2] = {0}, heights[2] = {0};
+	uint32_t crtc_count = 0;
+	for (int i = 0; i < resources->count_connectors && crtc_count < 2; i++) {
+		drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
+		if (!connector) continue;
+		if (connector->connection == DRM_MODE_CONNECTED &&
+			connector->connector_type == DRM_MODE_CONNECTOR_DSI && connector->encoder_id) {
+			drmModeEncoder *encoder = drmModeGetEncoder(fd, connector->encoder_id);
+			if (encoder && encoder->crtc_id) {
+				uint32_t crtc_id = encoder->crtc_id;
+				int duplicate = crtc_count > 0 && crtcs[0] == crtc_id;
+				if (!duplicate) {
+					drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
+					if (crtc && crtc->mode_valid) {
+						crtcs[crtc_count] = crtc_id;
+						widths[crtc_count] = crtc->mode.hdisplay;
+						heights[crtc_count] = crtc->mode.vdisplay;
+						crtc_count++;
+					}
+					if (crtc) drmModeFreeCrtc(crtc);
+				}
+				drmModeFreeEncoder(encoder);
+			}
+		}
+		drmModeFreeConnector(connector);
+	}
+	if (crtc_count != 2) {
+		SDL_Log("AV DRM test: skipped; expected two active DSI CRTCs, found %u", crtc_count);
+		return;
+	}
+
+	uint32_t overlay_ids[2] = {0};
+	drmModePlaneRes *planes = drmModeGetPlaneResources(fd);
+	if (!planes) {
+		SDL_Log("AV DRM test: skipped; plane enumeration failed: %s", strerror(errno));
+		return;
+	}
+	for (uint32_t i = 0; i < planes->count_planes; i++) {
+		drmModePlane *plane = drmModeGetPlane(fd, planes->planes[i]);
+		if (!plane) continue;
+		if (raw_drm_plane_is_overlay(fd, plane->plane_id)) {
+			for (uint32_t c = 0; c < 2; c++) {
+				int crtc_index = -1;
+				for (int j = 0; j < resources->count_crtcs; j++)
+					if (resources->crtcs[j] == crtcs[c]) { crtc_index = j; break; }
+				if (crtc_index >= 0 && (plane->possible_crtcs & (1u << crtc_index)) &&
+					!overlay_ids[c] && (!overlay_ids[1 - c] || overlay_ids[1 - c] != plane->plane_id)) {
+					for (uint32_t f = 0; f < plane->count_formats; f++)
+					if (plane->formats[f] == DRM_FORMAT_XRGB8888) overlay_ids[c] = plane->plane_id;
+				}
+			}
+		}
+		drmModeFreePlane(plane);
+	}
+	drmModeFreePlaneResources(planes);
+	if (!overlay_ids[0] || !overlay_ids[1]) {
+		SDL_Log("AV DRM test: skipped; XRGB8888 overlay planes not available for both CRTCs");
+		return;
+	}
+	if (widths[0] < 512 || heights[0] < 384 || widths[1] < 512 || heights[1] < 384) {
+		SDL_Log("AV DRM test: skipped; output mode is smaller than 512x384");
+		return;
+	}
+
+	uint32_t handle = 0, pitch = 0, framebuffer = 0;
+	uint64_t size = 0;
+	if (raw_drm_create_dumb_buffer(fd, 512, 384, 32, &handle, &pitch, &size) != 0) {
+		SDL_Log("AV DRM test: dumb-buffer allocation failed: %s", strerror(errno));
+		return;
+	}
+	(void)size;
+	uint32_t handles[4] = {handle, 0, 0, 0};
+	uint32_t pitches[4] = {pitch, 0, 0, 0};
+	uint32_t offsets[4] = {0, 0, 0, 0};
+	if (drmModeAddFB2(fd, 512, 384, DRM_FORMAT_XRGB8888, handles, pitches,
+		offsets, &framebuffer, 0) != 0) {
+		SDL_Log("AV DRM test: XRGB8888 framebuffer creation failed: %s", strerror(errno));
+		raw_drm_destroy_dumb_buffer(fd, handle);
+		return;
+	}
+
+	drmModeAtomicReqPtr request = drmModeAtomicAlloc();
+	int add_failed = request == NULL;
+	const char *plane_properties[] = {"FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+		"CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H"};
+	for (uint32_t c = 0; request && c < 2; c++) {
+		const uint64_t values[] = {framebuffer, crtcs[c], 0, 0, (uint64_t)512 << 16,
+			(uint64_t)384 << 16, 0, 0, widths[c], heights[c]};
+		for (size_t p = 0; p < sizeof(plane_properties) / sizeof(plane_properties[0]); p++) {
+			uint32_t property = raw_drm_property_id(fd, overlay_ids[c], DRM_MODE_OBJECT_PLANE,
+				plane_properties[p], NULL);
+			if (!property || drmModeAtomicAddProperty(request, overlay_ids[c], property, values[p]) < 0) {
+				add_failed = 1;
+				break;
+			}
+		}
+	}
+	int result = -1;
+	if (!add_failed)
+		result = drmModeAtomicCommit(fd, request, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+	if (request) drmModeAtomicFree(request);
+	SDL_Log("AV DRM test: dual_overlay_2x=%s crtc=%u:%ux%u plane=%u crtc=%u:%ux%u plane=%u format=XR24",
+		add_failed ? "setup-failed" : result == 0 ? "PASS" : "FAIL",
+		crtcs[0], widths[0], heights[0], overlay_ids[0],
+		crtcs[1], widths[1], heights[1], overlay_ids[1]);
+	if (add_failed) SDL_Log("AV DRM test: could not prepare required plane properties");
+	else if (result != 0) SDL_Log("AV DRM test: TEST_ONLY result=%d error=%s", result, strerror(errno));
+	drmModeRmFB(fd, framebuffer);
+	raw_drm_destroy_dumb_buffer(fd, handle);
+}
+
+static const char *const drm_overlay_property_names[10] = {
+	"FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+	"CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H"
+};
+
+static void raw_drm_overlay_destroy_buffer(DrmOverlayBuffer *buffer) {
+	if (buffer->pixels && buffer->pixels != MAP_FAILED) munmap(buffer->pixels, buffer->size);
+	if (buffer->framebuffer && drm_overlay.fd >= 0) drmModeRmFB(drm_overlay.fd, buffer->framebuffer);
+	if (buffer->handle && drm_overlay.fd >= 0) raw_drm_destroy_dumb_buffer(drm_overlay.fd, buffer->handle);
+	memset(buffer, 0, sizeof(*buffer));
+}
+
+static int raw_drm_overlay_disable(void) {
+	if (!drm_overlay.enabled || drm_overlay.fd < 0) return 0;
+	drmModeAtomicReqPtr request = drmModeAtomicAlloc();
+	if (!request) {
+		SDL_Log("DRM overlay: could not allocate plane-disable request");
+		return -1;
+	}
+	int failed = 0;
+	for (int i = 0; i < SCREEN_COUNT; i++) {
+		if (drmModeAtomicAddProperty(request, drm_overlay.plane[i], drm_overlay.property[i][0], 0) < 0 ||
+			drmModeAtomicAddProperty(request, drm_overlay.plane[i], drm_overlay.property[i][1], 0) < 0)
+			failed = 1;
+	}
+	if (failed) errno = EINVAL;
+	int result = failed ? -1 : drmModeAtomicCommit(drm_overlay.fd, request, 0, NULL);
+	drmModeAtomicFree(request);
+	if (result == 0) drm_overlay.enabled = 0;
+	else SDL_Log("DRM overlay: plane disable failed: %s", strerror(errno));
+	return result;
+}
+
+static void raw_drm_overlay_cleanup(void) {
+	int disabled = raw_drm_overlay_disable() == 0;
+	if (!disabled && drm_overlay.enabled) {
+		SDL_Log("DRM overlay: could not detach active planes during cleanup; leaving framebuffer handles for SDL DRM teardown");
+		for (int i = 0; i < SCREEN_COUNT; i++)
+			for (int b = 0; b < DRM_OVERLAY_BUFFERS; b++) {
+				DrmOverlayBuffer *buffer = &drm_overlay.buffers[i][b];
+				if (buffer->pixels && buffer->pixels != MAP_FAILED) munmap(buffer->pixels, buffer->size);
+				buffer->pixels = NULL;
+			}
+		return;
+	}
+	for (int i = 0; i < SCREEN_COUNT; i++)
+		for (int b = 0; b < DRM_OVERLAY_BUFFERS; b++)
+			raw_drm_overlay_destroy_buffer(&drm_overlay.buffers[i][b]);
+	memset(&drm_overlay, 0, sizeof(drm_overlay));
+	drm_overlay.fd = -1;
+}
+
+static int raw_drm_overlay_create_buffer(DrmOverlayBuffer *buffer) {
+	if (raw_drm_create_dumb_buffer(drm_overlay.fd, DS_WIDTH * 2, DS_HEIGHT * 2, 32,
+		&buffer->handle, &buffer->pitch, &buffer->size) != 0) return -1;
+	uint32_t handles[4] = {buffer->handle, 0, 0, 0};
+	uint32_t pitches[4] = {buffer->pitch, 0, 0, 0};
+	uint32_t offsets[4] = {0, 0, 0, 0};
+	if (drmModeAddFB2(drm_overlay.fd, DS_WIDTH * 2, DS_HEIGHT * 2, DRM_FORMAT_XRGB8888,
+		handles, pitches, offsets, &buffer->framebuffer, 0) != 0) return -1;
+	struct drm_mode_map_dumb map = {.handle = buffer->handle};
+	if (ioctl(drm_overlay.fd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0) return -1;
+	buffer->pixels = mmap(NULL, buffer->size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_overlay.fd, map.offset);
+	if (buffer->pixels == MAP_FAILED) { buffer->pixels = NULL; return -1; }
+	memset(buffer->pixels, 0, buffer->size);
+	return 0;
+}
+
+static int raw_drm_overlay_init(SDL_Window *window) {
+#if !defined(SDL_VIDEO_DRIVER_KMSDRM)
+	(void)window;
+	SDL_Log("DRM overlay: unavailable; SDL headers lack KMSDRM window information");
+	return -1;
+#else
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	if (!window || !SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_KMSDRM) {
+		SDL_Log("DRM overlay: unavailable; SDL KMSDRM window info was not returned");
+		return -1;
+	}
+	drm_overlay.fd = info.info.kmsdrm.drm_fd;
+	if (drm_overlay.fd < 0 || drmSetClientCap(drm_overlay.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0 ||
+		drmSetClientCap(drm_overlay.fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
+		SDL_Log("DRM overlay: unavailable; SDL DRM atomic client setup failed: %s", strerror(errno));
+		drm_overlay.fd = -1;
+		return -1;
+	}
+	drmModeRes *resources = drmModeGetResources(drm_overlay.fd);
+	drmModePlaneRes *planes = drmModeGetPlaneResources(drm_overlay.fd);
+	if (!resources || !planes) {
+		SDL_Log("DRM overlay: active DRM resource query failed: %s", strerror(errno));
+		if (resources) drmModeFreeResources(resources);
+		if (planes) drmModeFreePlaneResources(planes);
+		return -1;
+	}
+	for (int i = 0; i < resources->count_connectors && drm_overlay.crtc[1] == 0; i++) {
+		drmModeConnector *connector = drmModeGetConnector(drm_overlay.fd, resources->connectors[i]);
+		if (!connector) continue;
+		if (connector->connection == DRM_MODE_CONNECTED && connector->connector_type == DRM_MODE_CONNECTOR_DSI && connector->encoder_id) {
+			drmModeEncoder *encoder = drmModeGetEncoder(drm_overlay.fd, connector->encoder_id);
+			if (encoder && encoder->crtc_id) {
+				int duplicate = drm_overlay.crtc[0] == encoder->crtc_id;
+				if (!duplicate) {
+					drmModeCrtc *crtc = drmModeGetCrtc(drm_overlay.fd, encoder->crtc_id);
+					if (crtc && crtc->mode_valid) {
+						int n = drm_overlay.crtc[0] ? 1 : 0;
+						drm_overlay.crtc[n] = encoder->crtc_id;
+						drm_overlay.output_w[n] = crtc->mode.hdisplay;
+						drm_overlay.output_h[n] = crtc->mode.vdisplay;
+					}
+					if (crtc) drmModeFreeCrtc(crtc);
+				}
+				drmModeFreeEncoder(encoder);
+			}
+		}
+		drmModeFreeConnector(connector);
+	}
+	uint32_t primary_plane[SCREEN_COUNT] = {0};
+	for (uint32_t i = 0; i < planes->count_planes; i++) {
+		drmModePlane *plane = drmModeGetPlane(drm_overlay.fd, planes->planes[i]);
+		if (!plane) continue;
+		int is_overlay = raw_drm_plane_is_overlay(drm_overlay.fd, plane->plane_id);
+		int is_primary = raw_drm_plane_has_type(drm_overlay.fd, plane->plane_id, "Primary");
+		for (int s = 0; s < SCREEN_COUNT; s++) {
+			int ci = -1;
+			for (int c = 0; c < resources->count_crtcs; c++)
+				if (resources->crtcs[c] == drm_overlay.crtc[s]) ci = c;
+			if (ci < 0 || !(plane->possible_crtcs & (1u << ci))) continue;
+			if (is_primary && !primary_plane[s]) primary_plane[s] = plane->plane_id;
+			if (!is_overlay || drm_overlay.plane[s] || plane->plane_id == drm_overlay.plane[1 - s]) continue;
+			for (uint32_t f = 0; f < plane->count_formats; f++)
+				if (plane->formats[f] == DRM_FORMAT_XRGB8888) drm_overlay.plane[s] = plane->plane_id;
+		}
+		drmModeFreePlane(plane);
+	}
+	drmModeFreePlaneResources(planes);
+	drmModeFreeResources(resources);
+	for (int s = 0; s < SCREEN_COUNT; s++) {
+		if (!drm_overlay.crtc[s] || !drm_overlay.plane[s] ||
+			drm_overlay.output_w[s] != SCREEN_WIDTH || drm_overlay.output_h[s] != SCREEN_HEIGHT) {
+			SDL_Log("DRM overlay: two active 1024x768 XR24 overlay planes were not found");
+			goto fail;
+		}
+		for (int p = 0; p < 10; p++) {
+			drm_overlay.property[s][p] = raw_drm_property_id(drm_overlay.fd, drm_overlay.plane[s],
+				DRM_MODE_OBJECT_PLANE, drm_overlay_property_names[p], NULL);
+			if (!drm_overlay.property[s][p]) goto fail;
+		}
+		SDL_Log("DRM overlay: screen=%d crtc=%u plane=%u fb_prop=%u crtc_prop=%u",
+			s, drm_overlay.crtc[s], drm_overlay.plane[s], drm_overlay.property[s][0], drm_overlay.property[s][1]);
+		uint32_t primary_zpos_property = 0;
+		uint64_t primary_zpos = 0, primary_zpos_min = 0, primary_zpos_max = 0;
+		uint64_t overlay_zpos = 0, overlay_zpos_min = 0, overlay_zpos_max = UINT64_MAX;
+		int primary_zpos_immutable = 0, overlay_zpos_immutable = 0;
+		int have_primary_zpos = primary_plane[s] && raw_drm_get_zpos(drm_overlay.fd,
+			primary_plane[s], &primary_zpos_property, &primary_zpos,
+			&primary_zpos_min, &primary_zpos_max, &primary_zpos_immutable);
+		int have_overlay_zpos = raw_drm_get_zpos(drm_overlay.fd, drm_overlay.plane[s],
+			&drm_overlay.zpos_property[s], &overlay_zpos,
+			&overlay_zpos_min, &overlay_zpos_max, &overlay_zpos_immutable);
+		if (have_primary_zpos && have_overlay_zpos) {
+			if (overlay_zpos_immutable) {
+				if (overlay_zpos <= primary_zpos) {
+					SDL_Log("DRM overlay: immutable zpos=%llu is behind primary zpos=%llu",
+						(unsigned long long)overlay_zpos, (unsigned long long)primary_zpos);
+					goto fail;
+				}
+				drm_overlay.zpos_property[s] = 0;
+			} else {
+				uint64_t desired_zpos = primary_zpos + 1;
+				if (desired_zpos < overlay_zpos_min || desired_zpos > overlay_zpos_max) {
+					SDL_Log("DRM overlay: zpos range cannot place overlay above primary");
+					goto fail;
+				}
+				drm_overlay.zpos_value[s] = desired_zpos;
+			}
+			SDL_Log("DRM overlay: screen=%d primary_plane=%u primary_zpos=%llu overlay_zpos=%llu%s",
+				s, primary_plane[s], (unsigned long long)primary_zpos,
+				(unsigned long long)(drm_overlay.zpos_value[s] ? drm_overlay.zpos_value[s] : overlay_zpos),
+				overlay_zpos_immutable ? " immutable" : " requested");
+		} else {
+			drm_overlay.zpos_property[s] = 0;
+			SDL_Log("DRM overlay: screen=%d zpos property unavailable; driver plane ordering applies", s);
+		}
+		for (int b = 0; b < DRM_OVERLAY_BUFFERS; b++)
+			if (raw_drm_overlay_create_buffer(&drm_overlay.buffers[s][b]) != 0) {
+				SDL_Log("DRM overlay: buffer allocation failed: %s", strerror(errno));
+				goto fail;
+			}
+	}
+	drmModeAtomicReqPtr test = drmModeAtomicAlloc();
+	int test_failed = test == NULL;
+	for (int s = 0; test && s < SCREEN_COUNT; s++) {
+		DrmOverlayBuffer *buffer = &drm_overlay.buffers[s][0];
+		const uint64_t values[10] = {buffer->framebuffer, drm_overlay.crtc[s], 0, 0,
+			(uint64_t)(DS_WIDTH * 2) << 16, (uint64_t)(DS_HEIGHT * 2) << 16,
+			0, 0, drm_overlay.output_w[s], drm_overlay.output_h[s]};
+		for (int p = 0; p < 10; p++)
+			if (drmModeAtomicAddProperty(test, drm_overlay.plane[s], drm_overlay.property[s][p], values[p]) < 0)
+				test_failed = 1;
+		if (drm_overlay.zpos_property[s] && drmModeAtomicAddProperty(test, drm_overlay.plane[s],
+			drm_overlay.zpos_property[s], drm_overlay.zpos_value[s]) < 0) test_failed = 1;
+	}
+	int test_result = test_failed ? -1 : drmModeAtomicCommit(drm_overlay.fd, test, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+	if (test) drmModeAtomicFree(test);
+	if (test_result != 0) {
+		SDL_Log("DRM overlay: allocated-buffer TEST_ONLY failed: %s", strerror(errno));
+		goto fail;
+	}
+	SDL_Log("DRM overlay: buffers ready; source=512x384 output=1024x768 buffers=%d", DRM_OVERLAY_BUFFERS);
+	return 0;
+fail:
+	raw_drm_overlay_cleanup();
+	return -1;
+#endif
+}
+
+static int raw_drm_overlay_present(void) {
+	DrmOverlayBuffer *selected[SCREEN_COUNT];
+	for (int s = 0; s < SCREEN_COUNT; s++) {
+		int source = s ^ app.screen_swap;
+		DummyTexture *game = &app.dummy.screens[source];
+		if (!game->completed_pixels || game->width <= 0 || game->height <= 0 ||
+			game->width > DS_WIDTH * 2 || game->height > DS_HEIGHT * 2 ||
+			game->completed_pitch < game->width * 4) {
+			SDL_Log("DRM overlay: game image unavailable or exceeds 512x384; reverting to XGL");
+			return -1;
+		}
+		selected[s] = &drm_overlay.buffers[s][drm_overlay.next[s]++ % DRM_OVERLAY_BUFFERS];
+		if (selected[s]->pitch < (uint32_t)game->width * 4) return -1;
+		Uint64 copy_started = AVProfile_now(&av_profile);
+		for (int y = 0; y < game->height; y++)
+			memcpy((Uint8 *)selected[s]->pixels + (size_t)y * selected[s]->pitch,
+				(const Uint8 *)game->completed_pixels + (size_t)y * game->completed_pitch,
+				(size_t)game->width * 4);
+		if (av_profile.enabled) {
+			AVProfile_end(&av_profile, AV_UPLOAD, copy_started);
+			if (av_profile.detail) AVProfile_end(&av_profile, AV_UPLOAD_TOP + s, copy_started);
+		}
+	}
+	drmModeAtomicReqPtr request = drmModeAtomicAlloc();
+	if (!request) { SDL_Log("DRM overlay: could not allocate atomic request; reverting to XGL"); return -1; }
+	int failed = 0;
+	for (int s = 0; s < SCREEN_COUNT; s++) {
+		DrmOverlayBuffer *buffer = selected[s];
+		DummyTexture *game = &app.dummy.screens[s ^ app.screen_swap];
+		const uint64_t values[10] = {buffer->framebuffer, drm_overlay.crtc[s], 0, 0,
+			(uint64_t)game->width << 16, (uint64_t)game->height << 16,
+			0, 0, drm_overlay.output_w[s], drm_overlay.output_h[s]};
+		for (int p = 0; p < 10; p++)
+			if (drmModeAtomicAddProperty(request, drm_overlay.plane[s], drm_overlay.property[s][p], values[p]) < 0)
+				failed = 1;
+		if (drm_overlay.zpos_property[s] && drmModeAtomicAddProperty(request, drm_overlay.plane[s],
+			drm_overlay.zpos_property[s], drm_overlay.zpos_value[s]) < 0) failed = 1;
+	}
+	Uint64 commit_started = AVProfile_now(&av_profile);
+	if (failed) errno = EINVAL;
+	int result = failed ? -1 : drmModeAtomicCommit(drm_overlay.fd, request,
+		DRM_MODE_ATOMIC_NONBLOCK, NULL);
+	int commit_error = errno;
+	Uint64 committed = AVProfile_now(&av_profile);
+	drmModeAtomicFree(request);
+	if (av_profile.enabled) {
+		AVProfile_record(&av_profile, AV_PRESENT, committed - commit_started);
+		AVProfile_trackSpan(&av_profile, AV_PRESENT, commit_started, committed);
+	}
+	if (result != 0) {
+		if (commit_error == EBUSY) {
+			if (av_profile.enabled) AVProfile_record(&av_profile, AV_DRM_BUSY, 0);
+			return 1;
+		}
+		SDL_Log("DRM overlay: atomic update failed: %s; reverting to XGL", strerror(commit_error));
+		return -1;
+	}
+	drm_overlay.enabled = 1;
+	if (av_profile.enabled) {
+		AVProfile_record(&av_profile, AV_DRAW, 0);
+		AVProfile_record(&av_profile, AV_DRAW_TOP, 0);
+		AVProfile_record(&av_profile, AV_DRAW_BOTTOM, 0);
+		AVProfile_record(&av_profile, AV_SWAP_TOP, 0);
+		AVProfile_record(&av_profile, AV_SWAP_BOTTOM, 0);
+	}
+	return 0;
+}
+
 static void raw_init(void) {
 	raw.bri0 = open("/sys/class/backlight/backlight1/brightness", O_WRONLY | O_CLOEXEC);
 	raw.bri1 = open("/sys/class/backlight/backlight/brightness", O_WRONLY | O_CLOEXEC);
@@ -452,7 +1116,6 @@ static void raw_init(void) {
 			drmModeFreeResources(res);
 		}
 	}
-	
 }
 static void raw_quit(void) {
 	close(raw.bri0);
@@ -587,34 +1250,161 @@ static void raw_ip(char *out) {
 // settings
 // --------------------------------------------
 
+typedef enum {
+	DISPLAY_OFF, DISPLAY_HIRES, DISPLAY_MODE_COUNT
+} DisplayMode;
+
+static int Config_get_hires_3d(void);
+static int Config_set_hires_3d(int enabled);
+static void DisplayMode_cycle(void);
+static void ScreenSwap_load(void);
+static void ScreenSwap_toggle(void);
+static Uint32 display_notice_at;
+static int display_notice_pending = 1, display_notice_active;
+static const char *DisplayMode_label(int mode) {
+	static const char *labels[] = {"Off", "Hi-Res"};
+	return mode >= 0 && mode < DISPLAY_MODE_COUNT ? labels[mode] : labels[0];
+}
+
 static struct {
 	int version;
 	int volume;		// 0-20
 	int brightness;	// 0 - 10
 	int grid;
-	int unused[4];
+	int display_mode; // Reuses a reserved field without moving the saved ROM name.
+	int unused[3];
 	char game[MAX_PATH];
 } settings = {
-	.version = 1,
+	.version = 2,
 	.volume = 10,
 	.brightness = 5,
 	.grid = 1,
 };
 
 static void Settings_load(void) {
-	if (access(paths.settings, F_OK)!=0) return;
-	
-	FILE* file = fopen(paths.settings, "rb");
+	settings.display_mode = Config_get_hires_3d() ? DISPLAY_HIRES : DISPLAY_OFF;
+	FILE *file = fopen(paths.settings, "rb");
 	if (!file) return;
-	fread(&settings, sizeof(settings), 1, file);
+	__typeof__(settings) loaded = {0};
+	int valid = fread(&loaded, sizeof(loaded), 1, file) == 1;
 	fclose(file);
+	if (!valid || loaded.version < 1 || loaded.version > 2) return;
+	// The config is authoritative. In older builds mode 1 meant x4, so
+	// interpreting the saved field after removing x4 could enable Hi-Res.
+	loaded.display_mode = settings.display_mode;
+	loaded.version = 2;
+	loaded.game[sizeof(loaded.game) - 1] = '\0';
+	if (loaded.volume < 0 || loaded.volume > 20) loaded.volume = settings.volume;
+	if (loaded.brightness < 0 || loaded.brightness > 10) loaded.brightness = settings.brightness;
+	settings = loaded;
 }
-static void Settings_save(void) {
-	FILE* file = fopen(paths.settings, "wb");
-	if (!file) return;
-	fwrite(&settings, sizeof(settings), 1, file);
+static int Settings_save(void) {
+	char temporary[MAX_PATH];
+	if (snprintf(temporary, sizeof(temporary), "%s.tmp", paths.settings) >= (int)sizeof(temporary)) return 0;
+	FILE *file = fopen(temporary, "wb");
+	if (!file) return 0;
+	int saved = fwrite(&settings, sizeof(settings), 1, file) == 1;
+	if (fclose(file) != 0) saved = 0;
+	if (saved && rename(temporary, paths.settings) == 0) return 1;
+	unlink(temporary);
+	return 0;
+}
+static const char *const hires_config_keys[] = {
+	"hires_3d", "threaded_3d", "disable_edge_marking",
+	"fix_main_2d_screen", "frameskip_type", "frameskip_value"
+};
+static int Game_needs_single_threaded_hires(const char *id) {
+	return strncmp(id, "AZE", 3) == 0 || strncmp(id, "BKI", 3) == 0;
+}
+
+static int Config_get_hires_3d(void) {
+	char config_path[MAX_PATH];
+	Path_concat(config_path, paths.system, "/drastic/config/drastic.cfg");
+	FILE *file = fopen(config_path, "r");
+	if (!file) return 0;
+	char *line = NULL;
+	size_t capacity = 0;
+	int enabled = 0;
+	while (getline(&line, &capacity, file) >= 0) {
+		char *key = line;
+		while (*key == ' ' || *key == '\t') key++;
+		if (strncmp(key, "hires_3d", 8) != 0) continue;
+		key += 8;
+		while (*key == ' ' || *key == '\t') key++;
+		if (*key == '=') { enabled = atoi(key + 1) != 0; break; }
+	}
+	free(line);
 	fclose(file);
+	return enabled;
 }
+
+static int Config_set_hires_3d(int enabled) {
+	char config_path[MAX_PATH];
+	Path_concat(config_path, paths.system, "/drastic/config/drastic.cfg");
+	FILE *input = fopen(config_path, "r");
+	if (!input && errno != ENOENT) return 0;
+	char temporary[MAX_PATH];
+	if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", config_path, (long)getpid()) >= (int)sizeof(temporary)) {
+		if (input) fclose(input);
+		return 0;
+	}
+	FILE *output = fopen(temporary, "w");
+	if (!output) { if (input) fclose(input); return 0; }
+	struct stat st;
+	int have_mode = stat(config_path, &st) == 0;
+	char *line = NULL;
+	size_t capacity = 0;
+	// Calculate the selected profile once, then atomically replace all its keys.
+	const char *const *keys = hires_config_keys;
+	int single_threaded = enabled && Game_needs_single_threaded_hires(app.game_id);
+	const int values[] = {
+		enabled != 0, enabled && !single_threaded, enabled != 0,
+		0,
+		single_threaded ? 2 : 0, single_threaded ? 1 : 0
+	};
+	unsigned int replaced = 0;
+	ssize_t length;
+	if (input) {
+		while ((length = getline(&line, &capacity, input)) >= 0) {
+			char *key = line;
+			while (*key == ' ' || *key == '\t') key++;
+			int matched = 0;
+			for (size_t i = 0; i < NUMBER_OF(hires_config_keys); i++) {
+				size_t key_length = strlen(keys[i]);
+				if (strncmp(key, keys[i], key_length) != 0) continue;
+				char *after = key + key_length;
+				while (*after == ' ' || *after == '\t') after++;
+				if (*after != '=') continue;
+				if (fprintf(output, "%s = %d\n", keys[i], values[i]) < 0) goto fail;
+				replaced |= 1u << i;
+				matched = 1;
+				break;
+			}
+			if (matched) continue;
+			if (fwrite(line, 1, (size_t)length, output) != (size_t)length) goto fail;
+		}
+		if (ferror(input)) goto fail;
+	}
+	for (size_t i = 0; i < NUMBER_OF(hires_config_keys); i++) {
+		if (!(replaced & (1u << i)) &&
+			fprintf(output, "\n%s = %d\n", keys[i], values[i]) < 0) goto fail;
+	}
+	free(line);
+	if (input) fclose(input);
+	if (fclose(output) != 0) { unlink(temporary); return 0; }
+	if (have_mode) chmod(temporary, st.st_mode & 0777);
+	if (rename(temporary, config_path) != 0) { unlink(temporary); return 0; }
+	SDL_Log("Hi-Res config: game=%s hires=%d threaded=%d frameskip=%d/%d",
+		app.game_id, values[0], values[1], values[4], values[5]);
+	return 1;
+fail:
+	free(line);
+	if (input) fclose(input);
+	fclose(output);
+	unlink(temporary);
+	return 0;
+}
+
 static void Settings_setVolume(int value) {
 	raw_vol(value);
 	settings.volume = value;
@@ -1085,7 +1875,10 @@ static void drastic_await_save(void) {
 }
 
 static void drastic_load_nds_and_jump(const char* path) {
+	Profile_suspend();
 	drastic_await_save();
+	if (!Config_set_hires_3d(settings.display_mode == DISPLAY_HIRES))
+		SDL_Log("Could not update Hi-Res config before ROM reset");
 
 	Mic_quit();
 	
@@ -1100,6 +1893,7 @@ static void drastic_load_nds_and_jump(const char* path) {
 	longjmp(*env, 1); // no return
 }
 static void drastic_load_state(const char *name) {
+	Profile_suspend();
 	drastic_await_save();
 
 	void* sys = drastic_var_system();	
@@ -1109,7 +1903,7 @@ static void drastic_load_state(const char *name) {
 	Path_concat(path, paths.userdata, "/states/", name);
 	d_load_state(sys, path, NULL,NULL,0);
 }
-static void drastic_save_state(const char *name) {
+static int drastic_save_state(const char *name) {
 	drastic_await_save();
 
 	void* sys = drastic_var_system();	
@@ -1117,7 +1911,7 @@ static void drastic_save_state(const char *name) {
 		
 	char path[MAX_PATH];
 	Path_concat(path, paths.userdata, "/states/");
-	d_save_state(sys, path, (char *)name, NULL,NULL);
+	return d_save_state(sys, path, (char *)name, NULL,NULL) == 0;
 }
 static void drastic_quit(void) {
 	drastic_await_save();
@@ -1169,27 +1963,43 @@ static void PATCH_IMPL drastic_interpolate_uv_linear(int16_t *out, const uint8_t
 		const int16_t *delta = (const int16_t *)(spans + 0x370 + i*4);
 		unsigned width = *(const uint16_t *)(spans + 0x630 + i*4);
 		if (!width) continue;
-		int32_t uv[2], step[2], remainder[2], error[2] = {0,0};
-		for (unsigned axis=0; axis<2; axis++) {
-			uv[axis] = start[axis];
-			step[axis] = delta[axis] / (int32_t)width;
-			remainder[axis] = delta[axis] - step[axis]*(int32_t)width;
-			if (remainder[axis]<0) {
-				step[axis]--;
-				remainder[axis] += (int32_t)width;
+		int32_t width_i = (int32_t)width;
+		int32_t u = start[0], v = start[1];
+		int32_t step_u = delta[0] / width_i, step_v = delta[1] / width_i;
+		int32_t rem_u = delta[0] - step_u * width_i;
+		int32_t rem_v = delta[1] - step_v * width_i;
+		if (rem_u < 0) { step_u--; rem_u += width_i; }
+		if (rem_v < 0) { step_v--; rem_v += width_i; }
+
+		// Exact-divide spans need no per-pixel error accumulation.
+		if (rem_u == 0 && rem_v == 0) {
+			for (unsigned x=0; x<width; x++) {
+				*out++ = (int16_t)(u >> 4);
+				*out++ = (int16_t)(v >> 4);
+				u += step_u;
+				v += step_v;
 			}
+			continue;
 		}
-		for (unsigned x=0; x<width; x++) {
-			for (unsigned axis=0; axis<2; axis++) {
-				*out++ = (int16_t)(uv[axis] >> 4);
-				uv[axis] += step[axis];
-				error[axis] += remainder[axis];
-				if (error[axis]>=(int32_t)width) {
-					error[axis] -= (int32_t)width;
-					uv[axis]++;
-				}
-			}
+
+		int32_t error_u = 0, error_v = 0;
+		unsigned x = 0;
+#define EMIT_CORRECTED_UV() do { \
+			*out++ = (int16_t)(u >> 4); \
+			*out++ = (int16_t)(v >> 4); \
+			u += step_u; error_u += rem_u; \
+			if (error_u >= width_i) { error_u -= width_i; u++; } \
+			v += step_v; error_v += rem_v; \
+			if (error_v >= width_i) { error_v -= width_i; v++; } \
+		} while (0)
+		for (; x + 4 <= width; x += 4) {
+			EMIT_CORRECTED_UV();
+			EMIT_CORRECTED_UV();
+			EMIT_CORRECTED_UV();
+			EMIT_CORRECTED_UV();
 		}
+		for (; x < width; x++) EMIT_CORRECTED_UV();
+#undef EMIT_CORRECTED_UV
 	}
 	for (unsigned i=pixel_count; i<((pixel_count+7)&~7u); i++) {
 		*out++ = 0;
@@ -1398,6 +2208,12 @@ static NumberString getNumberString(const char *s, const char *start) {
 	return n;
 }
 
+static unsigned int Sort_codepoint(const char **text) {
+	unsigned int c = UTF8_next(text);
+	if (c >= 0x30a1 && c <= 0x30f6) c -= 0x60;
+	return c < 128 ? (unsigned int)tolower((unsigned char)c) : c;
+}
+
 static int compareNatural(const char *a, const char *b) {
 	const char *startA = a;
 	const char *startB = b;
@@ -1424,18 +2240,15 @@ static int compareNatural(const char *a, const char *b) {
 				return tolower((unsigned char)*a)<'0' ? -1 : 1;
 		}
 
-		int ca = tolower((unsigned char)*a);
-		int cb = tolower((unsigned char)*b);
+		unsigned int ca = Sort_codepoint(&a);
+		unsigned int cb = Sort_codepoint(&b);
 
 		if (ca!=cb) {
 			// ensure "Game.ext" sorts before "Game 2.ext"
 			if (ca=='.' && cb==' ') return -1;
 			if (ca==' ' && cb=='.') return  1;
-			return ca - cb;
+			return ca < cb ? -1 : 1;
 		}
-
-		a++;
-		b++;
 	}
 
 	return tolower((unsigned char)*a) - tolower((unsigned char)*b);
@@ -1446,253 +2259,82 @@ static int compareNatural(const char *a, const char *b) {
 // --------------------------------------------
 
 typedef struct {
-	uint8_t map[128];
-	uint8_t char_widths[128];
-	int8_t kern_pairs[128][128];
-
-	SDL_Surface* bitmap;
-	const char* name;
-	const char* charset;
+	struct _TTF_Font *ttf;
 	int8_t offset_x;
 	int8_t offset_y;
 	int8_t tracking;
-	uint8_t tile_width;
 	uint8_t tile_height;
-	uint8_t tiles_wide;
-	uint8_t tiles_high;
-	uint8_t missing;
-
-	uint8_t char_width;
-	uint8_t low_width;
 } Font;
 
-Font* font36 = &(Font){
-	.name = "font-dedicated-36.png",
-	.charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'!?&0123456789/$+%,: ",
-	.tile_width = 36,
-	.tile_height = 36,
-	.offset_x = -3,
-	.tracking = 6,
-	.char_width = 30,
-	.low_width = 24,
-	.char_widths = {
-		['I'] = 6,
-		['1'] = 18,
-		['.'] = 6,
-		[','] = 6,
-		['-'] = 24,
-		['+'] = 24,
-		['\''] = 6,
-		['!'] = 6,
-		[':'] = 6,
-		['&'] = 36,
-		[' '] = 12,
-	},
-	.kern_pairs = {
-		['A']['T'] = -6,
-		['T']['A'] = -6,
-		['A']['V'] = -6,
-		['V']['A'] = -6,
-		['A']['W'] = -3,
-		['W']['A'] = -3,
-		['A']['Y'] = -3,
-		['Y']['A'] = -3,
-		['T']['-'] = -6,
-		['-']['T'] = -6,
-		['L']['Y'] = -6,
-		['L']['T'] = -6,
-	},
-};
+typedef struct _TTF_Font TTF_Font;
+static void* ttf_library;
+static int (*ttf_init_fn)(void);
+static int (*ttf_was_init_fn)(void);
+static TTF_Font* (*ttf_open_font_fn)(const char*, int);
+static void (*ttf_close_font_fn)(TTF_Font*);
+static int (*ttf_size_utf8_fn)(TTF_Font*, const char*, int*, int*);
+static SDL_Surface* (*ttf_render_utf8_fn)(TTF_Font*, const char*, SDL_Color);
+static void (*ttf_quit_fn)(void);
+static const char* (*ttf_get_error_fn)(void);
+static int ttf_size_error_logged;
+static int ttf_render_error_logged;
 
-Font* font24 = &(Font){
-	.name = "font-dedicated-24.png",
-	.charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'!?&0123456789/$+%,: ",
-	.tile_width = 24,
-	.tile_height = 24,
-	.offset_x = -2,
-	.tracking = 4,
-	.char_width = 20,
-	.char_widths = {
-		['I'] = 4,
-		['1'] = 12,
-		['.'] = 4,
-		[','] = 4,
-		['-'] = 16,
-		['\''] = 4,
-		['!'] = 4,
-		[':'] = 4,
-		[' '] = 8,
-		['%'] = 21,
-	},
-	.kern_pairs = {
-		['A']['T'] = -4,
-		['T']['A'] = -4,
-		['A']['V'] = -4,
-		['V']['A'] = -4,
-		['A']['W'] = -2,
-		['W']['A'] = -2,
-		['A']['Y'] = -2,
-		['Y']['A'] = -2,
-		['T']['-'] = -4,
-		['-']['T'] = -4,
-		['L']['Y'] = -4,
-		['L']['T'] = -4,
-	},
-};
-
-Font* font18 = &(Font){
-	.name = "font-dedicated-18.png",
-	.charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'!?&0123456789/$+%,: ",
-	.tile_width = 18,
-	.tile_height = 18,
-	.offset_x = -1,
-	.tracking = 3,
-	.char_width = 15,
-	.char_widths = {
-		['I'] = 3,
-		['1'] = 9,
-		['.'] = 3,
-		[','] = 3,
-		['-'] = 12,
-		['\''] = 3,
-		['!'] = 3,
-		[':'] = 3,
-		[' '] = 6,
-	},
-	.kern_pairs = {
-		['A']['T'] = -3,
-		['T']['A'] = -3,
-		['A']['V'] = -3,
-		['V']['A'] = -3,
-		['A']['W'] = -1,
-		['W']['A'] = -1,
-		['A']['Y'] = -1,
-		['Y']['A'] = -1,
-		['T']['-'] = -3,
-		['-']['T'] = -3,
-		['L']['Y'] = -3,
-		['L']['T'] = -3,
-	},
-};
-
-Font* font16 = &(Font){
-	.name = "font-dedicated-16.png",
-	.charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'!?&0123456789/$+%,: ",
-	.tile_width = 16,
-	.tile_height = 16,
-	.offset_x = -1,
-	.tracking = 4,
-	.char_width = 12,
-	.char_widths = {
-		['I'] = 2,
-		['1'] = 8,
-		['.'] = 2,
-		[','] = 2,
-		['-'] = 10,
-		['\''] = 2,
-		['!'] = 2,
-		[':'] = 2,
-		[' '] = 4,
-	},
-	.kern_pairs = {
-		['A']['T'] = -2,
-		['T']['A'] = -2,
-		['A']['V'] = -2,
-		['V']['A'] = -2,
-		['A']['W'] = -1,
-		['W']['A'] = -1,
-		['A']['Y'] = -1,
-		['Y']['A'] = -1,
-		['T']['-'] = -2,
-		['-']['T'] = -2,
-		['L']['Y'] = -2,
-		['L']['T'] = -2,
-	},
-};
-
-static void Font_init(Font* font) {
-	char path[MAX_PATH];
-	Path_concat(path, paths.assets, "/", font->name);
-	font->bitmap = IMG_Load(path);
-	SDL_SetSurfaceBlendMode(font->bitmap, SDL_BLENDMODE_BLEND);
-	
-	font->tiles_wide = font->bitmap->w / font->tile_width;
-	font->tiles_high = font->bitmap->h / font->tile_height;
-	font->missing = (font->tiles_wide * font->tiles_high) - 1;
-	
-	memset(font->map, font->missing, sizeof(font->map));
-	for (uint8_t i=0; font->charset[i]; i++) {
-		unsigned char c = font->charset[i];
-		font->map[c] = (uint8_t)i;
-		if (!font->char_widths[c]) {
-			if (font->low_width && c>='a' && c<='z') {
-				font->char_widths[c] = font->low_width;
-			}
-			else {
-				font->char_widths[c] = font->char_width;
-			}
-		}
+static int TTF_load(void) {
+	if (ttf_library) return 1;
+	ttf_library = dlopen("libSDL2_ttf-2.0.so.0", RTLD_NOW | RTLD_LOCAL);
+	if (!ttf_library) {
+		SDL_Log("Could not load SDL_ttf runtime: %s", dlerror());
+		return 0;
 	}
+	ttf_init_fn = dlsym(ttf_library, "TTF_Init");
+	ttf_was_init_fn = dlsym(ttf_library, "TTF_WasInit");
+	ttf_open_font_fn = dlsym(ttf_library, "TTF_OpenFont");
+	ttf_close_font_fn = dlsym(ttf_library, "TTF_CloseFont");
+	ttf_size_utf8_fn = dlsym(ttf_library, "TTF_SizeUTF8");
+	ttf_render_utf8_fn = dlsym(ttf_library, "TTF_RenderUTF8_Blended");
+	ttf_quit_fn = dlsym(ttf_library, "TTF_Quit");
+	// SDL2_ttf exposes its error through SDL_GetError; TTF_GetError is not an exported symbol.
+	ttf_get_error_fn = dlsym(ttf_library, "SDL_GetError");
+	if (!ttf_init_fn || !ttf_was_init_fn || !ttf_open_font_fn || !ttf_close_font_fn ||
+		!ttf_size_utf8_fn || !ttf_render_utf8_fn || !ttf_quit_fn || !ttf_get_error_fn) {
+		dlclose(ttf_library);
+		ttf_library = NULL;
+		return 0;
+	}
+	return 1;
 }
+
+Font* font36 = &(Font){.tile_height = 36, .tracking = 2};
+Font* font24 = &(Font){.tile_height = 24, .tracking = 2};
+Font* font18 = &(Font){.tile_height = 18, .tracking = 1};
+Font* font16 = &(Font){.tile_height = 16, .tracking = 1};
+
 static void Font_quit(Font* font) {
-	SDL_FreeSurface(font->bitmap);
+	if (font->ttf) ttf_close_font_fn(font->ttf);
+	font->ttf = NULL;
 }
 
-static void __Font_drawChar(Font* font, SDL_Surface* dst, unsigned char c, int x, int y) {
-	int i = c<128 ? font->map[c] : font->missing;
-	int tx = i % font->tiles_wide;
-	int ty = i / font->tiles_wide;
-	int tw = font->tile_width;
-	int th = font->tile_height;
-	SDL_BlitSurface(font->bitmap, &(SDL_Rect){tx*tw,ty*th,tw,th}, dst, &(SDL_Rect){x,y,tw,th});
-}
-
-static void __Font_drawText(Font* font, const char* text, int* out_width, int* out_height, SDL_Surface** out_surface) {
-	SDL_Surface* dst = NULL;
-	if (out_surface) {
-		int w = 0;
-		int h = 0;
-		__Font_drawText(font, text, &w, &h, NULL);
-		dst = SDL_CreateRGBSurfaceWithFormat(0, w,h, 32, SDL_PIXELFORMAT_RGBA32);
-		SDL_FillRect(dst, NULL, 0);
-	}
-	
-	const char* tmp = text;
-	int ow = 0;
-	int oh = font->tile_height;
-	while (*tmp) {
-		unsigned char c = *tmp++;
-		unsigned char n = *tmp;
-		if (!font->char_widths[c]) c = toupper(c);
-		if (n && !font->char_widths[n]) n = toupper(n);
-		
-		if (out_surface) __Font_drawChar(font, dst, c, ow,0);
-
-		ow += font->char_widths[c] ? font->char_widths[c] : font->char_width;
-		if (n) {
-			ow += font->tracking;
-			if (font->kern_pairs[c][n]) {
-				ow += font->kern_pairs[c][n];
-			}
-			else {
-				ow += font->kern_pairs[0][n];
-			}
-		}
-	}
-	ow -= font->offset_x * 2; // reverse pad?
-	
-	if (out_width) *out_width = ow;
-	if (out_height) *out_height = oh;
-	if (out_surface) *out_surface = dst;
+static int Font_hasNonAscii(const char* text) {
+	for (const unsigned char* p=(const unsigned char*)text; *p; p++) if (*p>=0x80) return 1;
+	return 0;
 }
 
 static void Font_getTextSize(Font* font, const char* text, int* out_width, int* out_height) {
-	__Font_drawText(font, text, out_width, out_height, NULL);
+	int w=0, h=font->tile_height;
+	if (font->ttf && ttf_size_utf8_fn(font->ttf, text, &w, &h)==0) {
+		if (out_width) *out_width=w;
+		if (out_height) *out_height=h;
+		return;
+	}
+	if (!ttf_size_error_logged++) SDL_Log("TTF_SizeUTF8 failed: %s", ttf_get_error_fn ? ttf_get_error_fn() : "font unavailable");
+	if (out_width) *out_width=0;
+	if (out_height) *out_height=h;
 }
 
 static SDL_Surface* Font_drawText(Font* font, const char* text) {
-	SDL_Surface* surface = NULL;
-	__Font_drawText(font, text, NULL, NULL, &surface);
+	if (!font->ttf || !ttf_render_utf8_fn) return NULL;
+	SDL_Surface* surface = ttf_render_utf8_fn(font->ttf, text, WHITE_COLOR);
+	if (!surface && !ttf_render_error_logged++) SDL_Log("TTF_RenderUTF8_Blended failed: %s", ttf_get_error_fn());
 	return surface;
 }
 
@@ -1703,7 +2345,9 @@ static void __Font_renderText(XGL_Renderer* renderer, Font* font, const char* te
 	y += font->offset_y;
 
 	SDL_Surface* surface = Font_drawText(font, text);
+	if (!surface) return;
 	XGL_Texture* texture = XGL_CreateTextureFromSurface(renderer, surface);
+	if (!texture) { SDL_FreeSurface(surface); return; }
 	XGL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
 	
 	if (s) {
@@ -1728,16 +2372,32 @@ static void Font_shadowText(XGL_Renderer* renderer, Font* font, const char* text
 // --------------------------------------------
 
 static void Fonts_init(void) {
-	Font_init(font36);
-	Font_init(font24);
-	Font_init(font18);
-	Font_init(font16);
+	char path[MAX_PATH];
+	Path_concat(path, paths.assets, "/font.ttf");
+	if (access(path, R_OK) != 0 || !TTF_load()) {
+		SDL_Log("Noto Sans JP or SDL_ttf unavailable; launcher text cannot be rendered");
+		return;
+	}
+	if (ttf_init_fn() != 0) {
+		SDL_Log("SDL_ttf initialization failed: %s", ttf_get_error_fn());
+		return;
+	}
+	Font *fonts[] = {font36, font24, font18, font16};
+	for (size_t i = 0; i < NUMBER_OF(fonts); i++) {
+		fonts[i]->ttf = ttf_open_font_fn(path, fonts[i]->tile_height);
+		if (!fonts[i]->ttf) SDL_Log("Could not load Noto Sans JP at %d px: %s", fonts[i]->tile_height, ttf_get_error_fn());
+	}
 }
 static void Fonts_quit(void) {
 	Font_quit(font36);
 	Font_quit(font24);
 	Font_quit(font18);
 	Font_quit(font16);
+	if (ttf_library) {
+		if (ttf_was_init_fn()) ttf_quit_fn();
+		dlclose(ttf_library);
+		ttf_library = NULL;
+	}
 }
 
 // --------------------------------------------
@@ -2012,7 +2672,7 @@ static int Pad_pollEvent(SDL_Event* event) {
 static void App_init(void);
 static void App_quit(void);
 static void App_load(int slot);
-static void App_save(int slot);
+static int App_save(int slot);
 static void App_reset(void);
 static void App_extra(void);
 static void App_bye(void);
@@ -2104,6 +2764,7 @@ static void emitKeyEvent(int key, int press) {
 }
 
 static void Device_idle(void) {
+	Profile_suspend();
 	// enter
 	emitKeyEvent(KEY_LID, 1);
 	
@@ -2156,6 +2817,7 @@ static void Device_idling(void) {
 	}
 }
 static void Device_sleep(void) {
+	Profile_suspend();
 	raw_vol(0);
 	raw_bri(0);
 	raw_led(1);
@@ -2332,6 +2994,18 @@ static int Device_handleEvent(SDL_Event* event) {
 	}
 	
 	static int menu_combo = 0;
+	static int screenshot_menu_release = 0;
+	if (Pad_isPressed(PAD_MENU) && Pad_justPressed(PAD_A)) {
+		Pad_consume(PAD_A | PAD_MENU);
+		screenshot_menu_release = 1;
+		app.capture = 1;
+		return 1;
+	}
+	if (screenshot_menu_release && Pad_justReleased(PAD_MENU)) {
+		Pad_consume(PAD_MENU);
+		screenshot_menu_release = 0;
+		return 1;
+	}
 	if (Pad_justPressed(PAD_MENU)) {
 		menu_combo = 0;
 	}
@@ -2346,8 +3020,14 @@ static int Device_handleEvent(SDL_Event* event) {
 		
 		if (Pad_justPressed(PAD_START)) {
 			Pad_consume(PAD_START);
-			app.capture = 1;
 			menu_combo = 1;
+			DisplayMode_cycle();
+			return 1;
+		}
+		if (Pad_justPressed(PAD_SELECT)) {
+			Pad_consume(PAD_SELECT);
+			menu_combo = 1;
+			ScreenSwap_toggle();
 			return 1;
 		}
 	}
@@ -2391,6 +3071,28 @@ static void State_path(char *path, const char *game, const char *file) {
 static void State_snapPath(char *path, const char *game, const char *file) {
 	Path_concat(path, paths.userdata, "/snaps/", game, "/", file);
 }
+static void ScreenSwap_load(void) {
+	char path[MAX_PATH];
+	State_path(path, app.game_name, "screen.swap");
+	app.screen_swap = exists(path);
+}
+static void ScreenSwap_toggle(void) {
+	char path[MAX_PATH];
+	State_path(path, app.game_name, "screen.swap");
+	if (app.screen_swap) {
+		if (unlink(path) != 0 && errno != ENOENT) return;
+	} else {
+		char directory[MAX_PATH];
+		State_path(directory, app.game_name, "");
+		if (mkdir(directory, 0755) != 0 && errno != EEXIST) return;
+		FILE *file = fopen(path, "wb");
+		if (!file) return;
+		if (fclose(file) != 0) { unlink(path); return; }
+	}
+	app.screen_swap = !app.screen_swap;
+	SDL_Log("Screen swap: %s", app.screen_swap ? "ON" : "OFF");
+}
+
 static int State_latest(const uint8_t *index) {
 	int slot = -1;
 	for (int i=0; i<STATE_COUNT; i++) {
@@ -2440,25 +3142,22 @@ static void State_rank(uint8_t *index, int slot) {
 	index[slot] = index[other] + 1;
 }
 static void State_screenshot(int screen, const char *path) {
-	if (!app.xgl.screens[screen]) return;
-	XGL_Texture* texture = app.xgl.screens[screen];
-	int ok = 0;
-	void *pixels = NULL;
-	int pitch = 0;
-
-	int w,h,access;
-	Uint32 fmt;
-	XGL_QueryTexture(texture, &fmt, &access, &w, &h);
-	if (XGL_LockTexture(texture, NULL, &pixels, &pitch)<0) return;
-
-	const int depth = SDL_BITSPERPIXEL(fmt);
-	SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(pixels, w, h, depth, pitch, fmt);
-	if (surface) {
-		SDL_SaveBMP(surface, path);
-		SDL_FreeSurface(surface);
+	XGL_Texture *texture = app.xgl.screens[screen];
+	const void *pixels;
+	int pitch, w, h;
+	Uint32 format;
+	if (!texture || !path[0] || XGL_GetTexturePixels(texture, &pixels, &pitch) != 0) return;
+	XGL_QueryTexture(texture, &format, NULL, &w, &h);
+	SDL_Surface *view = SDL_CreateRGBSurfaceWithFormatFrom((void *)pixels, w, h,
+		SDL_BITSPERPIXEL(format), pitch, format);
+	if (!view) return;
+	SDL_SetSurfaceBlendMode(view, SDL_BLENDMODE_NONE);
+	SDL_Surface *snapshot = SDL_ConvertSurfaceFormat(view, SDL_PIXELFORMAT_RGB24, 0);
+	if (snapshot) {
+		if (SDL_SaveBMP(snapshot, path) != 0) SDL_Log("Snapshot failed: %s", SDL_GetError());
+		SDL_FreeSurface(snapshot);
 	}
-
-	XGL_UnlockTexture(texture);
+	SDL_FreeSurface(view);
 }
 static void State_load(const char *game, int slot) {
 	uint8_t index[STATE_COUNT];
@@ -2472,13 +3171,13 @@ static void State_load(const char *game, int slot) {
 
 	drastic_load_state(name);
 }
-static void State_save(const char *game, int slot) {
+static int State_save(const char *game, int slot) {
 	uint8_t index[STATE_COUNT];
-	if (!State_index(game, index) || !State_dirs(game)) return;
+	if (!State_index(game, index) || !State_dirs(game)) return 0;
 	
 	char name[MAX_PATH], path[MAX_PATH];
 	sprintf(name, "%s/%i.dss", game, slot);
-	drastic_save_state(name);
+	if (!drastic_save_state(name)) return 0;
 	
 	for (int screen=0; screen<SCREEN_COUNT; screen++) {
 		sprintf(name, "%i-%i.bmp", slot, screen);
@@ -2486,7 +3185,7 @@ static void State_save(const char *game, int slot) {
 		State_screenshot(screen, path);
 	}
 	State_rank(index, slot);
-	State_write(game, index);
+	return State_write(game, index);
 }
 
 // --------------------------------------------
@@ -2546,17 +3245,20 @@ static void App_preview(int game, int screen, int snap) {
 	Uint32 format;
 	XGL_QueryTexture(texture, &format, NULL, &w, &h);
 
-	if (format==tmp->format->format) {
-		XGL_UpdateTexture(texture, NULL, tmp->pixels, tmp->pitch);
-	} else {
-		void *dst;
-		int dst_pitch;
-		if (XGL_LockTexture(texture, NULL, &dst, &dst_pitch)==0) {
-			SDL_ConvertPixels(w, h, tmp->format->format, tmp->pixels, tmp->pitch, format, dst, dst_pitch);
-			XGL_UnlockTexture(texture);
+	SDL_Surface *scaled = SDL_CreateRGBSurfaceWithFormat(0, w, h, SDL_BITSPERPIXEL(format), format);
+	if (scaled) {
+		SDL_SetSurfaceBlendMode(tmp, SDL_BLENDMODE_NONE);
+		if (SDL_BlitScaled(tmp, NULL, scaled, NULL) == 0) {
+			/* Old ARGB snapshots may contain DraStic's broken Hi-Res alpha. */
+			for (int y = 0; y < h; y++) {
+				Uint32 *row = (Uint32 *)((Uint8 *)scaled->pixels + y * scaled->pitch);
+				for (int x = 0; x < w; x++) row[x] |= scaled->format->Amask;
+			}
+			XGL_UpdateTexture(texture, NULL, scaled->pixels, scaled->pitch);
 		}
+		SDL_FreeSurface(scaled);
 	}
-	
+
 	SDL_FreeSurface(tmp);
 }
 static void App_capture(const char *name) {
@@ -2571,10 +3273,41 @@ static void App_capture(const char *name) {
 }
 static void App_load(int slot) {
 	State_load(app.game_name, slot);
+	ScreenSwap_load();
 }
-static void App_save(int slot) {
-	State_save(app.game_name, slot);
-	ui.preview_current = -1; // why?
+static int App_save(int slot) {
+	int saved = State_save(app.game_name, slot);
+	ui.preview_current = -1;
+	return saved;
+}
+
+static void DisplayMode_cycle(void) {
+	DisplayMode before = settings.display_mode;
+	DisplayMode next = (before + 1) % DISPLAY_MODE_COUNT;
+	int restart = (before == DISPLAY_HIRES) != (next == DISPLAY_HIRES);
+	if (restart) {
+		if (!App_save(STATE_AUTO)) {
+			SDL_Log("Could not save state; keeping display mode %s", DisplayMode_label(before));
+			return;
+		}
+		drastic_await_save();
+		if (!Config_set_hires_3d(next == DISPLAY_HIRES)) {
+			SDL_Log("Could not update Hi-Res config; keeping current mode");
+			return;
+		}
+	}
+	settings.display_mode = next;
+	if (!Settings_save()) {
+		settings.display_mode = before;
+		if (restart) Config_set_hires_3d(before == DISPLAY_HIRES);
+		SDL_Log("Could not save display mode; keeping %s", DisplayMode_label(before));
+		return;
+	}
+	SDL_Log("Display mode %s -> %s%s", DisplayMode_label(before), DisplayMode_label(next),
+		restart ? "; saving and restarting" : "");
+	display_notice_pending = 1;
+	display_notice_active = 0;
+	if (restart) drastic_quit();
 }
 static void App_reset(void) {
 	drastic_audio_pause(0);
@@ -2621,6 +3354,29 @@ static void App_getDisplayName(const char* in_name, char* out_name) {
 }
 static int App_wrap(Font* font, char* text, int max_lines, char** lines, int* splits) {
 	int line_count = 0;
+	if (Font_hasNonAscii(text)) {
+		char line[1024] = {0};
+		const unsigned char* p=(const unsigned char*)text;
+		while (*p && line_count<max_lines) {
+			size_t n=UTF8_charBytes(p);
+			if (strlen(line)+n>=sizeof(line)) break;
+			char candidate[1024];
+			strcpy(candidate,line);
+			strncat(candidate,(const char*)p,n);
+			int width=0;
+			Font_getTextSize(font,candidate,&width,NULL);
+			if (width>SCREEN_WIDTH-40 && line[0]) {
+				lines[line_count++]=strdup(line);
+				line[0]='\0';
+				continue;
+			}
+			strcpy(line,candidate);
+			p+=n;
+		}
+		if (line[0] && line_count<max_lines) lines[line_count++]=strdup(line);
+		return line_count;
+	}
+
 
 	char line[1024] = {0};
 	char word[256] = {0};
@@ -2631,7 +3387,7 @@ static int App_wrap(Font* font, char* text, int max_lines, char** lines, int* sp
 		char* start = p;
 	
 		// get next word
-		while (*p && !isspace(*p)) p++;
+		while (*p && !isspace((unsigned char)*p)) p++;
 		int word_len = p - start;
 		strncpy(word, start, word_len);
 		word[word_len] = '\0';
@@ -2643,7 +3399,7 @@ static int App_wrap(Font* font, char* text, int max_lines, char** lines, int* sp
 				splits[line_count] = 1;
 				line[0] = '\0';
 			}
-			while (isspace(*p)) p++;
+			while (isspace((unsigned char)*p)) p++;
 			continue;
 		}
 	
@@ -2671,7 +3427,7 @@ static int App_wrap(Font* font, char* text, int max_lines, char** lines, int* sp
 		}
 	
 		// advance to next word
-		while (isspace(*p)) p++;
+		while (isspace((unsigned char)*p)) p++;
 	}
 
 	// add trailing line
@@ -2710,6 +3466,27 @@ static void App_trunc(Font* font, const char* text, int max_width, char* out_tex
 		return;
 	}
 	
+	if (Font_hasNonAscii(text)) {
+		const char* ellipsis = font->ttf ? "…" : "...";
+		int ew=0;
+		Font_getTextSize(font,ellipsis,&ew,NULL);
+		out_text[0]='\0';
+		const unsigned char* p=(const unsigned char*)text;
+		while (*p) {
+			size_t n=UTF8_charBytes(p);
+			size_t used=strlen(out_text);
+			if (used+n+strlen(ellipsis)>=MAX_FILE) break;
+			memcpy(out_text+used,p,n);
+			out_text[used+n]='\0';
+			int width=0;
+			Font_getTextSize(font,out_text,&width,NULL);
+			if (width+ew>max_width) { out_text[used]='\0'; break; }
+			p+=n;
+		}
+		strcat(out_text,ellipsis);
+		return;
+	}
+
 	const char* sep = "...";
 	int slen = strlen(sep);
 	int sw = 0;
@@ -2878,7 +3655,7 @@ static int App_status(void) {
 	if (!app.menu) return 0;
 	
 	Uint32 now = SDL_GetTicks();
-	if (ui.status_at && now<ui.status_at+1000) return 0;
+	if (ui.status_at && (Uint32)(now - ui.status_at) < 1000) return 0;
 	ui.status_at = now;
 	
 	int dirty = 0;
@@ -2899,6 +3676,11 @@ static int App_status(void) {
 static void App_focus(int current, int snap) {
 	ui.current = current;
 	ui.snap = snap;
+	char game_name[MAX_FILE], path[MAX_PATH];
+	App_snapName(current, snap, game_name);
+	if (snap == SNAP_CURRENT) strcpy(game_name, app.game_name);
+	State_path(path, game_name, "screen.swap");
+	ui.screen_swap = exists(path);
 	
 	if (ui.preview_current==current && ui.preview_snap==snap) return;
 	ui.preview_current = current;
@@ -2914,7 +3696,7 @@ static void App_grid(XGL_Renderer *renderer) {
 
 static void App_background(int screen) {
 	XGL_Renderer *renderer = app.xgl.renderers[screen];
-	XGL_RenderCopy(renderer, app.xgl.previews[screen], NULL, NULL);
+	XGL_RenderCopy(renderer, app.xgl.previews[screen ^ ui.screen_swap], NULL, NULL);
 	App_grid(renderer);
 	XGL_RenderCopy(renderer, app.xgl.overlay, &(SDL_Rect){0,screen*SCREEN_HEIGHT,1,SCREEN_HEIGHT}, NULL);
 }
@@ -2923,7 +3705,7 @@ static void App_hud(int hud) {
 	XGL_Renderer *renderer = app.xgl.renderers[0];
 	
 	if (hud) {
-		Font_shadowText(renderer, font24, "Nintendo DS", 20,20, LIGHT_COLOR);
+		Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
 		
 		char name[MAX_FILE];
 		App_getDisplayName(app.items[ui.current].name, name);
@@ -2933,9 +3715,13 @@ static void App_hud(int hud) {
 		int splits[MAX_LINES] = {0};
 		int line_count = App_wrap(font36, name, MAX_LINES, lines, splits);
 		SDL_Color color = WHITE_COLOR;
+		int line_y = 56;
 		for (int i=0; i<line_count; i++) {
 			if (splits[i]) color = LIGHT_COLOR;
-			Font_shadowText(renderer, font36, lines[i], 20, 56+(i*39), color);
+			int height = 0;
+			Font_getTextSize(font36, lines[i], NULL, &height);
+			Font_shadowText(renderer, font36, lines[i], 20, line_y, color);
+			line_y += height > 36 ? height + 3 : 39;
 			free(lines[i]);
 		}
 	}
@@ -2954,16 +3740,11 @@ static void App_bottom(void) {
 }
 
 static void App_bye(void) {
+	if (drm_overlay_mode) (void)raw_drm_overlay_disable();
 	App_extra();
 	
 	int battery = getInt(app.bat);
 	int is_charging = getInt(app.usb);
-	// const char* lines[] = {
-	// 	"Saving &",
-	// 	"shutting",
-	// 	"down...",
-	// };
-	
 	for (int i=0; i<SCREEN_COUNT; i++) {
 		XGL_Renderer *renderer = app.xgl.renderers[i];
 
@@ -2974,12 +3755,12 @@ static void App_bye(void) {
 		
 		if (i==0) {
 			App_battery(renderer, battery,is_charging,1);	
-			Font_shadowText(renderer, font24, "Dedicated OS", 20,20, LIGHT_COLOR);
-			Font_shadowText(renderer, font36, "Saving & shutting down...", 20, 20+36, WHITE_COLOR);
+			Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
+			const char* message = "Saving & shutting down...";
+			int message_width = 0;
+			Font_getTextSize(font24, message, &message_width, NULL);
+			Font_shadowText(renderer, font24, message, (SCREEN_WIDTH - message_width) / 2, 56, WHITE_COLOR);
 			
-			// for (int j=0; j<3; j++) {
-			// 	Font_shadowText(renderer, font36, lines[j], 20, 56+(j*36), WHITE_COLOR);
-			// }
 		}
 
 		XGL_RenderPresent(renderer);
@@ -3004,7 +3785,7 @@ static void App_empty(void) {
 		
 		if (i==0) {
 			App_battery(renderer, battery,is_charging,1);	
-			Font_shadowText(renderer, font24, "Dedicated OS", 20,20, LIGHT_COLOR);
+			Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
 			Font_shadowText(renderer, font36, "No games found", 20, 56, WHITE_COLOR);
 		}
 
@@ -3039,6 +3820,14 @@ static void App_set(int i) {
 	char *dot = strrchr(app.game_name, '.');
 	if (dot && dot!=app.game_name) *dot = '\0';
 	
+	memset(app.game_id, 0, sizeof(app.game_id));
+	FILE *rom = fopen(app.game_path, "rb");
+	if (rom) {
+		if (fseek(rom, 0x0c, SEEK_SET) != 0 || fread(app.game_id, 1, 4, rom) != 4)
+			memset(app.game_id, 0, sizeof(app.game_id));
+		fclose(rom);
+	}
+	ScreenSwap_load();
 	SDL_Log("settings.game: %s", settings.game);
 	SDL_Log("app.game_path: %s", app.game_path);
 	SDL_Log("app.game_name: %s", app.game_name);
@@ -3055,12 +3844,25 @@ static int App_next(int start, int dir) {
 	return start;
 }
 
+static int game_rgba_upload_requested;
+static int no_present_mode;
+static int hw_probe_mode;
+static Uint64 hw_probe_report_at;
+static int shared_context_mode;
+
 static void App_boot(void) {
 	SDL_Log("App_boot");
+	const char *rgba_upload = getenv("DRASTIC_GAME_RGBA");
+	game_rgba_upload_requested = rgba_upload && strcmp(rgba_upload, "1") == 0;
+	SDL_Log("Game upload mode: %s", game_rgba_upload_requested ? "RGBA + shader R/B swap" : "BGRA");
 	
 	// before even drastic loads
 	// this is drastic setup logic
 	Paths_init();
+	mkdir(paths.userdata, 0755);
+	char userdata_path[MAX_PATH];
+	mkdir(Path_concat(userdata_path, paths.userdata, "/states"), 0755);
+	mkdir(Path_concat(userdata_path, paths.userdata, "/snaps"), 0755);
 	raw_init();
 	
 	Settings_load();
@@ -3121,6 +3923,36 @@ static void App_boot(void) {
 	
 	App_set(app.current);
 }
+static const char *game_vertex_shader =
+	"attribute vec2 a_position; attribute vec2 a_texcoord;"
+	"uniform vec2 u_view_size; varying vec2 v_texcoord;"
+	"void main() { vec2 p = a_position / u_view_size * 2.0 - 1.0;"
+	"gl_Position = vec4(p.x, -p.y, 0.0, 1.0); v_texcoord = a_texcoord; }";
+static const char *game_fragment_shader =
+	"precision mediump float; varying vec2 v_texcoord;"
+	"uniform sampler2D u_texture; uniform vec4 u_color;"
+	"uniform sampler2D u_grid; uniform bool u_grid_enabled;"
+	"uniform vec2 u_grid_size; uniform float u_grid_height; uniform vec4 u_grid_color;"
+	"void main() { vec4 color = vec4(texture2D(u_texture, v_texcoord).rgb * u_color.rgb, u_color.a);"
+	"if (u_grid_enabled) {"
+		"vec2 p = vec2(gl_FragCoord.x, u_grid_height - gl_FragCoord.y);"
+		"vec4 grid = texture2D(u_grid, p / u_grid_size) * u_grid_color;"
+		/* Match the old GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA overlay, including A. */
+		"color = grid * grid.a + color * (1.0 - grid.a);"
+	"} gl_FragColor = color; }";
+static const char *game_fragment_shader_rgba =
+	"precision mediump float; varying vec2 v_texcoord;"
+	"uniform sampler2D u_texture; uniform vec4 u_color;"
+	"uniform sampler2D u_grid; uniform bool u_grid_enabled;"
+	"uniform vec2 u_grid_size; uniform float u_grid_height; uniform vec4 u_grid_color;"
+	"void main() { vec4 sample_color = texture2D(u_texture, v_texcoord);"
+	"vec4 color = vec4(sample_color.bgr * u_color.rgb, u_color.a);"
+	"if (u_grid_enabled) {"
+		"vec2 p = vec2(gl_FragCoord.x, u_grid_height - gl_FragCoord.y);"
+		"vec4 grid = texture2D(u_grid, p / u_grid_size) * u_grid_color;"
+		"color = grid * grid.a + color * (1.0 - grid.a);"
+	"} gl_FragColor = color; }";
+
 static void App_init(void) {
 	SDL_Log("App_init");
 	
@@ -3132,21 +3964,74 @@ static void App_init(void) {
 	
 	for (int i=0; i<SCREEN_COUNT; i++) {
 		SDL_Window *window = real_SDL_CreateWindow(NULL, i*SCREEN_WIDTH,0, SCREEN_WIDTH,SCREEN_HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL);
-		SDL_GLContext context = SDL_GL_CreateContext(window);
+		SDL_GLContext context = NULL;
 		if (i == 0) {
+			context = SDL_GL_CreateContext(window);
 			SDL_GL_MakeCurrent(window, context);
 			SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+		} else if (shared_context_mode) {
+			context = app.xgl.contexts[0];
+			if (SDL_GL_MakeCurrent(window, context) != 0) {
+				SDL_Log("Shared GL context could not bind screen %d; using a separate shared context: %s", i, SDL_GetError());
+				shared_context_mode = 0;
+				context = SDL_GL_CreateContext(window);
+			}
+		} else {
+			context = SDL_GL_CreateContext(window);
 		}
 		XGL_Renderer *renderer = XGL_CreateRenderer(window, context);
-		XGL_Texture *screen = XGL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, XGL_TEXTUREACCESS_STREAMING, DS_WIDTH, DS_HEIGHT);
-
+		XGL_SetProfileScreen(renderer, i);
+		const char *swap = getenv("DRASTIC_SWAP_INTERVAL");
+		if (swap && *swap) {
+			if (strcmp(swap, "-1") && strcmp(swap, "0") && strcmp(swap, "1"))
+				SDL_Log("Ignoring invalid DRASTIC_SWAP_INTERVAL=%s", swap);
+			else if (SDL_GL_SetSwapInterval(atoi(swap)) != 0)
+				SDL_Log("Screen %d: swap interval request failed: %s", i, SDL_GetError());
+		}
+		SDL_Log("Screen %d: swap_interval requested=%s actual=%d", i,
+			swap && *swap ? swap : "driver-default", SDL_GL_GetSwapInterval());
+		SDL_Log("Screen %d: GL context=%s", i,
+			i == 1 && shared_context_mode ? "shared surface" : "separate");
+		if (i == 0) SDL_Log("GL vendor=%s renderer=%s version=%s", glGetString(GL_VENDOR),
+			glGetString(GL_RENDERER), glGetString(GL_VERSION));
 		app.xgl.windows[i] = window;
 		app.xgl.contexts[i] = context;
 		app.xgl.renderers[i] = renderer;
+		const char *fragment_shader = game_rgba_upload_requested ?
+			game_fragment_shader_rgba : game_fragment_shader;
+		app.xgl.game_shaders[i] = XGL_CreateShader(renderer, game_vertex_shader, fragment_shader);
+		if (!app.xgl.game_shaders[i] && game_rgba_upload_requested) {
+			SDL_Log("RGBA game shader unavailable on screen %d; falling back to BGRA: %s", i, SDL_GetError());
+			app.xgl.game_shaders[i] = XGL_CreateShader(renderer, game_vertex_shader, game_fragment_shader);
+		}
+		app.xgl.game_rgba_upload[i] = game_rgba_upload_requested && app.xgl.game_shaders[i] != NULL;
+		XGL_Texture *screen = XGL_CreateTexture(renderer,
+			app.xgl.game_rgba_upload[i] ? SDL_PIXELFORMAT_ABGR8888 : SDL_PIXELFORMAT_ARGB8888,
+			XGL_TEXTUREACCESS_STREAMING, DS_WIDTH, DS_HEIGHT);
+		if (!app.xgl.game_shaders[i]) SDL_Log("Game shader unavailable; using CPU alpha correction: %s", SDL_GetError());
 		app.xgl.screens[i] = screen;
+		XGL_SetTextureProfileScreen(screen, i);
 		
 		app.dummy.renderers[i] = (DummyRenderer){.window = window};
-		app.dummy.screens[i] = (DummyTexture){.texture = screen};
+		app.dummy.screens[i] = (DummyTexture){.texture = screen, .width = DS_WIDTH,
+			.height = DS_HEIGHT, .format = SDL_PIXELFORMAT_ARGB8888};
+		int ow = 0, oh = 0;
+		XGL_GetRendererOutputSize(renderer, &ow, &oh);
+		SDL_Log("Screen %d: output=%dx%d; mode=%s", i, ow, oh, DisplayMode_label(settings.display_mode));
+	}
+	if (raw.drm >= 0) {
+		drmModeRes *resources = drmModeGetResources(raw.drm);
+		if (resources) {
+			raw_drm_report(raw.drm, resources);
+			raw_drm_test_dual_overlay(raw.drm, resources);
+			drmModeFreeResources(resources);
+		} else if (av_profile.detail) {
+			SDL_Log("AV DRM: resource query unavailable: %s", strerror(errno));
+		}
+	}
+	if (drm_overlay_requested) {
+		if (raw_drm_overlay_init(app.xgl.windows[0]) == 0) drm_overlay_mode = 1;
+		else SDL_Log("DRM overlay: initialization failed; retaining XGL output");
 	}
 	
 	XGL_Renderer *renderer = app.xgl.renderers[0];	
@@ -3156,6 +4041,7 @@ static void App_init(void) {
 	app.xgl.notches = XGL_LoadTexture(renderer, Path_concat(path, paths.assets, "/notches.png"));
 
 	app.xgl.grid = XGL_LoadTexture(renderer, Path_concat(path, paths.assets, "/grid.png"));
+	SDL_Log("Game grid fusion=%s (DRASTIC_FUSED_GRID=0 selects the original overlay)", use_fused_grid ? "enabled" : "disabled");
 	
 	SDL_Log("video driver: %s", SDL_GetCurrentVideoDriver());
 
@@ -3170,6 +4056,7 @@ static void App_init(void) {
 }
 static void App_quit(void) {
 	SDL_Log("App_quit");
+	raw_drm_overlay_cleanup();
 	
 	free(app.items);
 	
@@ -3189,13 +4076,16 @@ static void App_quit(void) {
 	TimeZone_quit();
 	Fonts_quit();
 	
-	// drastic never destroys renderers or windows so this is safe
+	// Drastic never destroys renderers or windows; release shared contexts only after all renderers.
 	for (int i=0; i<SCREEN_COUNT; i++) {
+		XGL_DestroyShader(app.xgl.game_shaders[i]);
 		XGL_DestroyTexture(app.xgl.screens[i]);
 		XGL_DestroyRenderer(app.xgl.renderers[i]);
-		SDL_GL_DeleteContext(app.xgl.contexts[i]);
-		SDL_DestroyWindow(app.xgl.windows[i]);
 	}
+	for (int i=0; i<SCREEN_COUNT; i++)
+		if (i == 0 || app.xgl.contexts[i] != app.xgl.contexts[i-1])
+			SDL_GL_DeleteContext(app.xgl.contexts[i]);
+	for (int i=0; i<SCREEN_COUNT; i++) SDL_DestroyWindow(app.xgl.windows[i]);
 	
 	XGL_Quit();
 	
@@ -4006,7 +4896,10 @@ static void App_archive(int current) {
 				App_trunc(font24, name, SCREEN_WIDTH-40, fit);
 		
 				XGL_RenderCopy(renderer, app.xgl.icons, &(SDL_Rect){item->hidden?24:0,0,24,24}, &(SDL_Rect){x+8,oy+8,24,24});
-				Font_renderText(renderer, font24, fit,	x+40,oy+10, c);
+				int height = 0;
+				Font_getTextSize(font24, fit, NULL, &height);
+				int text_y = Font_hasNonAscii(fit) ? oy + (h - height) / 2 : oy + 10;
+				Font_renderText(renderer, font24, fit, x+40, text_y, c);
 			}
 			
 			if (app.capture) App_capture("menu");
@@ -4182,6 +5075,8 @@ static uint64_t time_us(void) {
 }
 
 static void App_menu(void) {
+	if (drm_overlay_mode) (void)raw_drm_overlay_disable();
+	Profile_suspend();
 	uint64_t open_us = time_us();
 	app.menu = 1;
 	
@@ -4414,19 +5309,78 @@ static void App_menu(void) {
 }
 
 static int rendered_first_frame = 0;
+static int drm_overlay_frame_eligible(void) {
+	return drm_overlay_mode && !settings.grid && !app.osd && !app.menu &&
+		!app.capture && !display_notice_pending && !display_notice_active;
+}
+
+static void Game_makeOpaque(DummyTexture *dummy);
+static void drm_overlay_sync_xgl_textures(void) {
+	for (int i = 0; i < SCREEN_COUNT; i++) {
+		DummyTexture *game = &app.dummy.screens[i];
+		if (game->completed_pixels && game->texture) {
+			void *saved_pixels = game->locked_pixels;
+			SDL_Rect saved_rect = game->locked_rect;
+			game->locked_pixels = (void *)game->completed_pixels;
+			game->locked_rect = (SDL_Rect){0, 0, game->width, game->height};
+			Game_makeOpaque(game);
+			game->locked_pixels = saved_pixels;
+			game->locked_rect = saved_rect;
+			XGL_UpdateTexture(game->texture, NULL, game->completed_pixels, game->completed_pitch);
+		}
+	}
+}
+
 static void App_render(void) {
 	if (idling) {
 		real_SDL_Delay(1); // drastic paces itself
 		return;
 	}
 	
+	/* Captures read both backbuffers before either is swapped. Keep their old
+	 * ordering even when the grouped comparison path is selected. */
+	int grouped = use_grouped_present && !app.capture;
+	Uint64 draw_ticks = 0, present_ticks = 0;
 	for (int i=0; i<SCREEN_COUNT; i++) {
+		Uint64 draw_started = AVProfile_now(&av_profile);
 		XGL_Renderer *renderer = app.xgl.renderers[i];
-		XGL_RenderCopy(renderer, app.xgl.screens[i], NULL, NULL);
-		App_grid(renderer);
+		int source = i ^ app.screen_swap;
+		int fused = settings.grid && use_fused_grid &&
+			XGL_SetShaderGrid(app.xgl.game_shaders[i], app.xgl.grid) == 0 && app.xgl.grid;
+		app.xgl.fused_grid_last[i] = fused;
+		Uint64 screen_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
+		XGL_SetRenderShader(renderer, app.xgl.game_shaders[i]);
+		XGL_RenderCopy(renderer, app.xgl.screens[source], NULL, NULL);
+		XGL_SetShaderGrid(app.xgl.game_shaders[i], NULL);
+		if (av_profile.detail) {
+			AVProfile_end(&av_profile, AV_DRAW_TOP + i, screen_started);
+		}
+		XGL_SetRenderShader(renderer, NULL);
+		if (settings.grid && !fused) {
+			Uint64 grid_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
+			App_grid(renderer);
+			if (av_profile.detail) AVProfile_end(&av_profile, AV_GRID_TOP + i, grid_started);
+		}
 		
 		if (i==0) {
+			Uint64 overlay_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
 			OSD_render(renderer);
+			if (display_notice_pending) {
+				const void *pixels;
+				int pitch;
+				if (XGL_GetTexturePixels(app.xgl.screens[0], &pixels, &pitch) == 0 &&
+					XGL_GetTexturePixels(app.xgl.screens[1], &pixels, &pitch) == 0) {
+					display_notice_pending = 0;
+					display_notice_active = 1;
+					display_notice_at = SDL_GetTicks();
+				}
+			}
+			if (display_notice_active) {
+				if ((Uint32)(SDL_GetTicks() - display_notice_at) < 3000)
+					Font_shadowText(renderer, font24, DisplayMode_label(settings.display_mode),
+						SCREEN_WIDTH * 3 / 4, SCREEN_HEIGHT / 2, WHITE_COLOR);
+				else display_notice_active = 0;
+			}
 
 			if (audio.mute) {
 				if (!app.xgl.icons) {
@@ -4435,13 +5389,38 @@ static void App_render(void) {
 				}
 				XGL_RenderCopy(renderer, app.xgl.icons, &(SDL_Rect){48,0,24,24}, &(SDL_Rect){4,4,24,24});
 			}
+			if (av_profile.detail) AVProfile_end(&av_profile, AV_OVERLAY, overlay_started);
+		}
+		if (av_profile.enabled) {
+			Uint64 ended = AVProfile_now(&av_profile);
+			draw_ticks += ended - draw_started;
+			AVProfile_trackSpan(&av_profile, AV_DRAW, draw_started, ended);
+		}
+		if (grouped) {
+			Uint64 started = AVProfile_now(&av_profile);
+			XGL_RenderPresent(renderer);
+			if (av_profile.enabled) {
+				Uint64 ended = AVProfile_now(&av_profile);
+				present_ticks += ended - started;
+				AVProfile_trackSpan(&av_profile, AV_PRESENT, started, ended);
+			}
 		}
 	}
+	/* One aggregate sample per frame, even though grouped mode interleaves
+	 * two disjoint draw spans with two swap spans. Never count waits as draw. */
+	AVProfile_record(&av_profile, AV_DRAW, draw_ticks);
 
 	if (app.capture) App_capture("game");
-	for (int i=0; i<SCREEN_COUNT; i++) {
-		XGL_RenderPresent(app.xgl.renderers[i]);
+	if (!grouped) {
+		Uint64 started = AVProfile_now(&av_profile);
+		for (int i=0; i<SCREEN_COUNT; i++) XGL_RenderPresent(app.xgl.renderers[i]);
+		if (av_profile.enabled) {
+			Uint64 ended = AVProfile_now(&av_profile);
+			present_ticks = ended - started;
+			AVProfile_trackSpan(&av_profile, AV_PRESENT, started, ended);
+		}
 	}
+	AVProfile_record(&av_profile, AV_PRESENT, present_ticks);
 	
 	if (!rendered_first_frame) {
 		dmesg("rendered_first_frame");
@@ -4497,6 +5476,11 @@ int SDL_RenderCopy(SDL_Renderer *renderer, SDL_Texture  *texture, const SDL_Rect
 }
 void SDL_RenderPresent(SDL_Renderer *_) {
 	if (loader.state!=LOADER_IDLE) {
+		if (drm_overlay_mode && drm_overlay.enabled) {
+			(void)raw_drm_overlay_disable();
+			drm_overlay_sync_xgl_textures();
+		}
+		Profile_suspend();
 		if (loader.state==LOADER_REQUESTED) {
 			puts("[LOAD] requesting load...");
 			loader.state = LOADER_AWAITING;
@@ -4519,36 +5503,190 @@ void SDL_RenderPresent(SDL_Renderer *_) {
 		return;
 	}
 	
-	App_render(); // complete render takeover
+	if (idling) {
+		if (drm_overlay_mode && drm_overlay.enabled) (void)raw_drm_overlay_disable();
+		Profile_suspend();
+		App_render();
+		Device_tick();
+		return;
+	}
+	if (av_profile.detail && !AVProfile_isFrameThread(&av_profile)) AVSystem_setMainThread(&av_system);
+	if (av_profile.enabled) AVProfile_pauseAudio(&av_profile, 0);
+	AVProfile_frame(&av_profile);
+	if (!no_present_mode) {
+		if (drm_overlay_frame_eligible()) {
+			int result = raw_drm_overlay_present();
+			if (result < 0) {
+				drm_overlay_mode = 0;
+				(void)raw_drm_overlay_disable();
+				drm_overlay_sync_xgl_textures();
+				App_render();
+			} else if (result > 0) {
+				/* Keep the previous scanout on EBUSY; never stall audio for a retry. */
+				if (av_profile.enabled) {
+					AVProfile_record(&av_profile, AV_DRAW, 0);
+					AVProfile_record(&av_profile, AV_DRAW_TOP, 0);
+					AVProfile_record(&av_profile, AV_DRAW_BOTTOM, 0);
+					AVProfile_record(&av_profile, AV_SWAP_TOP, 0);
+					AVProfile_record(&av_profile, AV_SWAP_BOTTOM, 0);
+				}
+			}
+		} else {
+			if (drm_overlay_mode && drm_overlay.enabled) {
+				(void)raw_drm_overlay_disable();
+				drm_overlay_sync_xgl_textures();
+				SDL_Log("DRM overlay: temporarily hidden for UI; XGL output restored");
+			}
+			App_render();
+		}
+	} // complete render takeover
+	else if (av_profile.enabled) {
+		// Keep the profiling series visible while explicitly measuring a skipped pipeline.
+		AVProfile_record(&av_profile, AV_UPLOAD, 0);
+		AVProfile_record(&av_profile, AV_UPLOAD, 0);
+		AVProfile_record(&av_profile, AV_UPLOAD_TOP, 0);
+		AVProfile_record(&av_profile, AV_UPLOAD_BOTTOM, 0);
+		AVProfile_record(&av_profile, AV_DRAW, 0);
+		AVProfile_record(&av_profile, AV_DRAW_TOP, 0);
+		AVProfile_record(&av_profile, AV_DRAW_BOTTOM, 0);
+		AVProfile_record(&av_profile, AV_PRESENT, 0);
+		AVProfile_record(&av_profile, AV_SWAP_TOP, 0);
+		AVProfile_record(&av_profile, AV_SWAP_BOTTOM, 0);
+	}
+	Uint64 report_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
+	if (AVProfile_report(&av_profile, DisplayMode_label(settings.display_mode))) {
+		SDL_Log("AV display: grid=%d fused_top=%d fused_bottom=%d screen_swap=%d render_order=%s no_present=%d drm_overlay=%d",
+			settings.grid, app.xgl.fused_grid_last[0], app.xgl.fused_grid_last[1], app.screen_swap,
+			use_grouped_present ? "grouped" : "batched", no_present_mode, drm_overlay_mode && drm_overlay.enabled);
+		if (av_profile.detail) {
+			AVSystem_report(&av_system);
+			AVProfile_end(&av_profile, AV_REPORT_IO, report_started);
+		}
+	}
+	if (hw_probe_mode && !av_profile.detail) {
+		Uint64 now = SDL_GetPerformanceCounter();
+		Uint64 frequency = SDL_GetPerformanceFrequency();
+		if (!hw_probe_report_at || now - hw_probe_report_at >= frequency * 5) {
+			AVSystem_report(&av_system);
+			hw_probe_report_at = now;
+		}
+	}
 
 	// no before-drastic-frame hook so call this 
 	// as late as possible so it's ready at the 
 	// beginning of the next frame
+	Uint64 device_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
 	Device_tick();
+	if (av_profile.detail && av_profile.last_frame) AVProfile_end(&av_profile, AV_DEVICE, device_started);
+	AVProfile_leavePresent(&av_profile);
 }
 
 SDL_Texture *SDL_CreateTexture(SDL_Renderer *renderer, Uint32 format, int type, int w, int h) {
-	if (type==SDL_TEXTUREACCESS_STREAMING && w==DS_WIDTH && h==DS_HEIGHT) {
-		for (int i=0; i<SCREEN_COUNT; i++) {
+	if (type == SDL_TEXTUREACCESS_STREAMING &&
+		((w == DS_WIDTH && h == DS_HEIGHT) || (w == DS_WIDTH * 2 && h == DS_HEIGHT * 2))) {
+		for (int i = 0; i < SCREEN_COUNT; i++) {
 			DummyTexture *dummy = &app.dummy.screens[i];
-			if (!dummy->claimed) {
-				dummy->claimed = 1;
-				return (SDL_Texture *)dummy;
+			if (dummy->claimed) continue;
+			if (dummy->width != w || dummy->height != h || dummy->format != format) {
+				XGL_Texture *texture = XGL_CreateTexture(app.xgl.renderers[i],
+					app.xgl.game_rgba_upload[i] ? SDL_PIXELFORMAT_ABGR8888 : format,
+					XGL_TEXTUREACCESS_STREAMING, w, h);
+				if (!texture) return NULL;
+				XGL_DestroyTexture(dummy->texture);
+				dummy->completed_pixels = NULL;
+				dummy->pixel_base = NULL;
+				dummy->texture = app.xgl.screens[i] = texture;
+				dummy->width = w;
+				dummy->height = h;
+				dummy->format = format;
 			}
+			dummy->claimed = 1;
+			XGL_SetTextureProfileScreen(dummy->texture, i);
+			SDL_Log("Game screen %d: %dx%d %s", i, w, h, SDL_GetPixelFormatName(format));
+			return (SDL_Texture *)dummy;
 		}
+		return NULL;
 	}
 	return (SDL_Texture *)&app.dummy.ignored;
+}
+static void Game_makeOpaque(DummyTexture *dummy) {
+	if (app.xgl.game_shaders[0] && app.xgl.game_shaders[1]) return;
+	int bits;
+	Uint32 red, green, blue, alpha;
+	if (!SDL_PixelFormatEnumToMasks(dummy->format, &bits, &red, &green, &blue, &alpha) || !alpha) return;
+	if (bits != 32) return;
+#if defined(__ARM_NEON)
+	uint8x16_t mask = vreinterpretq_u8_u32(vdupq_n_u32(alpha));
+#endif
+	for (int y = 0; y < dummy->locked_rect.h; y++) {
+		Uint8 *row = (Uint8 *)dummy->locked_pixels + y * dummy->locked_pitch;
+		int x = 0;
+#if defined(__ARM_NEON)
+		for (; x + 4 <= dummy->locked_rect.w; x += 4)
+			vst1q_u8(row + x * 4, vorrq_u8(vld1q_u8(row + x * 4), mask));
+#endif
+		for (; x < dummy->locked_rect.w; x++) {
+			Uint32 pixel;
+			memcpy(&pixel, row + x * 4, 4);
+			pixel |= alpha;
+			memcpy(row + x * 4, &pixel, 4);
+		}
+	}
 }
 int SDL_LockTexture(SDL_Texture * texture, const SDL_Rect * rect, void **pixels, int *pitch) {
 	DummyTexture *dummy = (DummyTexture *)texture;
 	if (!dummy || !dummy->texture) return SDL_SetError("invalid texture lock");
-	return XGL_LockTexture(dummy->texture, rect, pixels, pitch);
+	int result = XGL_LockTexture(dummy->texture, rect, pixels, pitch);
+	if (result == 0) {
+		dummy->locked_pixels = *pixels;
+		dummy->locked_pitch = *pitch;
+		dummy->locked_rect = rect ? *rect : (SDL_Rect){0, 0, dummy->width, dummy->height};
+		dummy->pixel_base = (Uint8 *)*pixels -
+			(size_t)dummy->locked_rect.y * (size_t)*pitch -
+			(size_t)dummy->locked_rect.x * SDL_BYTESPERPIXEL(dummy->format);
+		dummy->pixels_started = av_profile.detail && av_profile.last_frame ? AVProfile_now(&av_profile) : 0;
+	}
+	return result;
 }
 void SDL_UnlockTexture(SDL_Texture * texture) {
 	DummyTexture *dummy = (DummyTexture *)texture;
-	if (dummy && dummy->texture) XGL_UnlockTexture(dummy->texture);
+	if (dummy && dummy->texture && dummy->locked_pixels) {
+		if (av_profile.detail && av_profile.last_frame && dummy->pixels_started)
+			AVProfile_end(&av_profile, AV_PIXELS, dummy->pixels_started);
+		dummy->pixels_started = 0;
+		dummy->completed_pixels = dummy->pixel_base;
+		dummy->completed_pitch = dummy->locked_pitch;
+		if (!no_present_mode && !(drm_overlay_frame_eligible())) {
+			Uint64 alpha_started = AVProfile_now(&av_profile);
+			Game_makeOpaque(dummy);
+			if (av_profile.last_frame) AVProfile_end(&av_profile, AV_ALPHA, alpha_started);
+		}
+		if (no_present_mode || drm_overlay_frame_eligible()) XGL_UnlockTextureDiscard(dummy->texture);
+		else XGL_UnlockTexture(dummy->texture);
+		dummy->locked_pixels = NULL;
+		dummy->pixel_base = NULL;
+	}
 }
 int SDL_UpdateTexture(SDL_Texture * texture, const SDL_Rect * rect, const void *pixels, int pitch) {
+	DummyTexture *dummy = (DummyTexture *)texture;
+	if (!dummy || !dummy->texture) return 0;
+	SDL_Rect area = rect ? *rect : (SDL_Rect){0, 0, dummy->width, dummy->height};
+	if (area.x < 0 || area.y < 0 || area.w <= 0 || area.h <= 0 ||
+		area.x >= dummy->width || area.y >= dummy->height ||
+		area.w > dummy->width - area.x || area.h > dummy->height - area.y)
+		return SDL_SetError("Invalid game texture rectangle");
+	int bytes = area.w * SDL_BYTESPERPIXEL(dummy->format);
+	if (!pixels || bytes <= 0 || pitch < bytes) return SDL_SetError("Invalid game texture pixels");
+	if (no_present_mode) return 0;
+	void *destination;
+	int destination_pitch;
+	if (SDL_LockTexture(texture, rect, &destination, &destination_pitch) != 0) return -1;
+	dummy->pixels_started = 0; // This is our copy, not DraStic writing between Lock/Unlock.
+	Uint64 prepare_started = AVProfile_now(&av_profile);
+	for (int y = 0; y < area.h; y++)
+		memmove((Uint8 *)destination + y * destination_pitch, (const Uint8 *)pixels + y * pitch, bytes);
+	if (av_profile.last_frame) AVProfile_end(&av_profile, AV_PREPARE, prepare_started);
+	SDL_UnlockTexture(texture);
 	return 0;
 }
 void SDL_DestroyTexture(SDL_Texture *texture) {
@@ -4556,7 +5694,7 @@ void SDL_DestroyTexture(SDL_Texture *texture) {
 	if (dummy) dummy->claimed = 0;
 }
 
-int SDL_PollEvent(SDL_Event* event) {
+static int App_pollEvent(SDL_Event* event) {
 	while (1) {
 		int result = Pad_pollEvent(event);
 		if (!result) return result;
@@ -4586,28 +5724,67 @@ int SDL_PollEvent(SDL_Event* event) {
 		return result;
 	}
 }
+int SDL_PollEvent(SDL_Event *event) {
+	int detail = av_profile.detail && av_profile.last_frame && !app.menu && !idling;
+	Uint64 started = detail ? AVProfile_now(&av_profile) : 0;
+	int result = App_pollEvent(event);
+	if (detail && av_profile.last_frame && !app.menu && !idling)
+		AVProfile_end(&av_profile, AV_INPUT, started);
+	return result;
+}
+
 int SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained) {
 	dmesg("SDL_OpenAudio");
 	raw_audio_init();
 	raw_vol(0);
-	
-	SDL_AudioSpec hijacked = *desired;
+	if (!desired || !desired->callback) return real_SDL_OpenAudio(desired, obtained);
+	SDL_AudioSpec requested = *desired, hijacked = *desired;
 	audio.callback = desired->callback;
 	audio.userdata = desired->userdata;
 	hijacked.callback = Audio_callback;
 	hijacked.userdata = NULL;
-	// hijacked.samples = 256;
-	
+	const char *probe = AVProbe_configure(&av_profile, app.base, desired);
+	if (av_profile.enabled) {
+		av_profile.callback = Audio_callback;
+		av_profile.audio_userdata = NULL;
+		AVProfile_audioSpec(&av_profile, desired);
+		hijacked.callback = AVProfile_audioCallback;
+		hijacked.userdata = &av_profile;
+	}
 	int result = real_SDL_OpenAudio(&hijacked, obtained);
-	Settings_setVolume(settings.volume); // must be done here (or later)
+	if (result == 0) {
+		const SDL_AudioSpec *actual = obtained ? obtained : &hijacked;
+		if (av_profile.enabled) AVProfile_audioSpec(&av_profile, actual);
+		if (actual->format != AUDIO_S16SYS && av_profile.ring_read) {
+			av_profile.ring_read = av_profile.ring_write = NULL;
+			probe = "obtained-audio-format";
+		}
+		if (!obtained) { desired->size = hijacked.size; desired->silence = hijacked.silence; }
+		const char *driver = SDL_GetCurrentAudioDriver();
+		SDL_Log("Audio driver=%s; requested rate=%d format=0x%x channels=%u samples=%u; obtained rate=%d format=0x%x channels=%u samples=%u; ring_probe=%s reason=%s",
+			driver ? driver : "unknown", requested.freq, requested.format, requested.channels, requested.samples,
+			actual->freq, actual->format, actual->channels, actual->samples,
+			av_profile.ring_read ? "enabled" : "disabled", probe);
+		if (av_profile.detail) SDL_Log("AV detail: delay_callsite_probe=%s; ring_short observes the internal ring, not ALSA xruns",
+			av_profile.known_delay_sites ? "enabled" : "disabled");
+	} else {
+		av_profile.callback = NULL;
+		av_profile.audio_userdata = NULL;
+		av_profile.ring_read = av_profile.ring_write = NULL;
+		av_profile.known_delay_sites = 0;
+		SDL_Log("SDL_OpenAudio failed: %s", SDL_GetError());
+	}
+	Settings_setVolume(settings.volume);
 	return result;
 }
 void SDL_Delay(uint32_t ms) {
-	if (ms>16) {
-		SDL_Log("excessive SDL_Delay(%i)!", ms);
-		ms = 16;
-	}
+	Uint32 requested = ms;
+	int detail = AVProfile_isFrameThread(&av_profile) && av_profile.last_frame;
+	Uint64 started = detail ? AVProfile_now(&av_profile) : 0;
+	if (ms > 16) ms = 16;
 	real_SDL_Delay(ms);
+	if (detail) AVProfile_delay(&av_profile,
+		(uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)), requested, ms, started);
 }
 
 // --------------------------------------------
@@ -4748,7 +5925,7 @@ ssize_t read(int fd, void *buf, size_t count) {
 	return n;
 }
 
-int gettimeofday(struct timeval *tv, void *tz) {
+int gettimeofday(struct timeval *tv, struct timezone *tz) {
 	int r = real_gettimeofday(tv, tz);
 	if (r == 0 && tv) {
 		uint64_t us = tv->tv_sec * 1000000ULL + tv->tv_usec;
@@ -4821,7 +5998,50 @@ static inline void hook(void) {
 static drastic_main_t drastic_main = NULL;
 static int override_args(int argc, char **argv, char **envp) {
 	hook();
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+	const char *profile = getenv("DRASTIC_PROFILE");
+	int level = profile && !strcmp(profile, "2") ? 2 : profile && !strcmp(profile, "1") ? 1 : 0;
+	AVProfile_init(&av_profile, level);
+	av_profile.executable_base = app.base;
+	AVProfile_pauseAudio(&av_profile, 1);
+	XGL_SetProfile(level ? &av_profile : NULL);
+	const char *fused = getenv("DRASTIC_FUSED_GRID");
+	use_fused_grid = !fused || strcmp(fused, "0");
+	const char *order = getenv("DRASTIC_PRESENT_ORDER");
+	use_grouped_present = order && !strcmp(order, "grouped");
+	const char *no_present = getenv("DRASTIC_NO_PRESENT");
+	const char *null_present = getenv("DRASTIC_NULL_PRESENT");
+	const char *drm_overlay = getenv("DRASTIC_DRM_OVERLAY");
+	drm_overlay_requested = drm_overlay && !strcmp(drm_overlay, "1");
+	no_present_mode = (no_present && !strcmp(no_present, "1")) ||
+		(null_present && !strcmp(null_present, "1"));
+	if (null_present && !strcmp(null_present, "1"))
+		SDL_Log("Null present mode: enabled (skipping upload/draw/swap)");
+	else if (no_present_mode)
+		SDL_Log("AV diagnostic: no_present=1 (game upload, draw and swap bypassed)");
+	if (drm_overlay_requested)
+		SDL_Log("DRM overlay mode: enabled (direct plane output)");
+	if (drm_overlay_requested && no_present_mode) {
+		SDL_Log("DRM overlay: disabled because null-present diagnostics are active");
+		drm_overlay_requested = 0;
+	}
+	const char *hw_probe = getenv("DRASTIC_HW_PROBE");
+	hw_probe_mode = hw_probe && !strcmp(hw_probe, "1");
+	hw_probe_report_at = SDL_GetPerformanceCounter();
+	const char *shared_context = getenv("DRASTIC_SHARED_CONTEXT");
+	shared_context_mode = shared_context && !strcmp(shared_context, "1");
+	if (shared_context_mode)
+		SDL_Log("AV display experiment: shared_context=1 (two windows and two swaps retained)");
+	if (order && strcmp(order, "grouped") && strcmp(order, "batched"))
+		SDL_Log("Ignoring invalid DRASTIC_PRESENT_ORDER=%s; using batched", order);
+	if (use_grouped_present) SDL_Log("Game render order=grouped");
+	if (av_profile.detail) SDL_Log("AV detail: enabled; schema=dsplus-xgl-2; thread CPU clock=%s; draw/present are per-frame sums of disjoint spans; statistics every 5 seconds",
+		av_profile.cpu_available ? "available" : "unavailable");
+	if (hw_probe_mode) SDL_Log("AV hardware probe: enabled (five-second interval)");
 	App_boot();
+	if (!Config_set_hires_3d(settings.display_mode == DISPLAY_HIRES))
+		SDL_Log("Could not synchronize Hi-Res configuration");
 	char *new_argv[] = { argv[0], app.game_path, NULL };
 	
 	puts("[LOAD] resume requested");

@@ -20,6 +20,8 @@ struct XGL_Renderer {
 	XGL_Shader *current_shader;
 	GLuint white_texture;
 	GLuint quad_vbo;
+	XGL_Texture *target;
+	int profile_screen;
 };
 
 struct XGL_Shader {
@@ -35,6 +37,9 @@ struct XGL_Shader {
 	GLint uniform_texture_size;
 	GLint uniform_input_size;
 	GLint uniform_source_pos;
+	GLint uniform_grid, uniform_grid_enabled, uniform_grid_size, uniform_grid_height;
+	GLint uniform_grid_color;
+	XGL_Texture *grid;
 };
 
 struct XGL_Texture {
@@ -55,6 +60,12 @@ struct XGL_Texture {
 	void *lock_pixels;
 	int lock_pitch;
 	SDL_bool locked;
+	SDL_Rect locked_rect;
+	SDL_bool ready;
+	SDL_bool flipped;
+	GLenum filter;
+	SDL_bool repeat;
+	int profile_screen;
 };
 
 typedef enum XGL_RenderMode {
@@ -68,6 +79,18 @@ typedef struct XGL_Vertex {
 	GLfloat u;
 	GLfloat v;
 } XGL_Vertex;
+
+static AVProfile *xgl_profile;
+void XGL_SetProfile(AVProfile *profile) { xgl_profile = profile; }
+void XGL_SetProfileScreen(XGL_Renderer *renderer, int screen) {
+	if (renderer) renderer->profile_screen = screen;
+}
+void XGL_SetTextureProfileScreen(XGL_Texture *texture, int screen) {
+	if (texture) texture->profile_screen = screen;
+}
+static AVProfile *XGL_activeProfile(void) {
+	return xgl_profile && xgl_profile->enabled && xgl_profile->last_frame ? xgl_profile : NULL;
+}
 
 int XGL_Init(void) {
 	if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES) != 0) {
@@ -197,6 +220,13 @@ static const char *XGL_sharp_fragment_shader =
 
 static SDL_bool XGL_GetPixelFormat(Uint32 sdl_format, XGL_PixelFormat *format) {
 	switch (sdl_format) {
+		case SDL_PIXELFORMAT_ABGR8888:
+			if (format) {
+				format->gl_format = GL_RGBA;
+				format->gl_type = GL_UNSIGNED_BYTE;
+				format->bytes_per_pixel = 4;
+			}
+			return SDL_TRUE;
 		case SDL_PIXELFORMAT_ARGB8888:
 			if (format) {
 				format->gl_format = GL_BGRA_EXT;
@@ -317,6 +347,11 @@ XGL_Shader *XGL_CreateShader(XGL_Renderer *renderer, const char *vertex_source, 
 	shader->uniform_texture_size = glGetUniformLocation(shader->program, "u_texture_size");
 	shader->uniform_input_size = glGetUniformLocation(shader->program, "u_input_size");
 	shader->uniform_source_pos = glGetUniformLocation(shader->program, "u_source_pos");
+	shader->uniform_grid = glGetUniformLocation(shader->program, "u_grid");
+	shader->uniform_grid_enabled = glGetUniformLocation(shader->program, "u_grid_enabled");
+	shader->uniform_grid_size = glGetUniformLocation(shader->program, "u_grid_size");
+	shader->uniform_grid_height = glGetUniformLocation(shader->program, "u_grid_height");
+	shader->uniform_grid_color = glGetUniformLocation(shader->program, "u_grid_color");
 	if (shader->attr_position < 0 || shader->attr_texcoord < 0 || shader->uniform_view_size < 0 || shader->uniform_texture < 0 || shader->uniform_color < 0) {
 		SDL_SetError("XGL_CreateShader: shader is missing required inputs");
 		glDeleteProgram(shader->program);
@@ -382,6 +417,23 @@ int XGL_SetRenderShader(XGL_Renderer *renderer, XGL_Shader *shader) {
 	return 0;
 }
 
+int XGL_SetShaderGrid(XGL_Shader *shader, XGL_Texture *grid) {
+	if (!shader) return -1;
+	shader->grid = NULL;
+	if (grid && (shader->uniform_grid < 0 || shader->uniform_grid_enabled < 0 ||
+		shader->uniform_grid_size < 0 || shader->uniform_grid_height < 0 ||
+		shader->uniform_grid_color < 0 || grid->blend_mode != SDL_BLENDMODE_BLEND)) return -1;
+	shader->grid = grid;
+	return 0;
+}
+
+static void XGL_SetTextureRepeat(XGL_Texture *texture, SDL_bool repeat) {
+	if (texture->repeat == repeat) return;
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+	texture->repeat = repeat;
+}
+
 static void XGL_ApplyTextureParameters(void) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -411,16 +463,28 @@ static int XGL_SetCurrentRenderer(XGL_Renderer *renderer) {
 		SDL_SetError("XGL_SetCurrentRenderer: renderer is NULL");
 		return -1;
 	}
-	if (SDL_GL_MakeCurrent(renderer->window, renderer->context) != 0) {
-		return -1;
+	if (SDL_GL_GetCurrentContext() == renderer->context &&
+		SDL_GL_GetCurrentWindow() == renderer->window) return 0;
+	AVProfile *profile = XGL_activeProfile();
+	Uint64 started = profile && profile->detail ? AVProfile_now(profile) : 0;
+	int result = SDL_GL_MakeCurrent(renderer->window, renderer->context);
+	if (profile && profile->detail) {
+		AVProfile_end(profile, AV_CONTEXT, started);
+		if (renderer->profile_screen >= 0 && renderer->profile_screen < 2)
+			AVProfile_end(profile, AV_CONTEXT_TOP + renderer->profile_screen, started);
 	}
-	return 0;
+	return result;
 }
 
 static int XGL_UpdateRendererOutputSize(XGL_Renderer *renderer) {
 	if (!renderer) {
 		SDL_SetError("XGL_UpdateRendererOutputSize: renderer is NULL");
 		return -1;
+	}
+	if (renderer->target) {
+		renderer->output_w = renderer->target->w;
+		renderer->output_h = renderer->target->h;
+		return 0;
 	}
 	SDL_GL_GetDrawableSize(renderer->window, &renderer->output_w, &renderer->output_h);
 	if (renderer->output_w <= 0 || renderer->output_h <= 0) {
@@ -473,6 +537,8 @@ XGL_Texture *XGL_CreateTexture(XGL_Renderer *renderer, Uint32 format, int access
 	texture->color_g = 255;
 	texture->color_b = 255;
 	texture->alpha = 255;
+	texture->filter = GL_NEAREST;
+	texture->profile_screen = -1;
 
 	glGenTextures(1, &texture->id);
 	if (!texture->id) {
@@ -484,7 +550,15 @@ XGL_Texture *XGL_CreateTexture(XGL_Renderer *renderer, Uint32 format, int access
 	glBindTexture(GL_TEXTURE_2D, texture->id);
 	XGL_ApplyTextureParameters();
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	(void)glGetError();
 	glTexImage2D(GL_TEXTURE_2D, 0, texture->gl_format, texture->w, texture->h, 0, texture->gl_format, texture->gl_type, NULL);
+	GLenum error = glGetError();
+	if (error != GL_NO_ERROR) {
+		glDeleteTextures(1, &texture->id);
+		SDL_free(texture);
+		SDL_SetError("Texture allocation failed (GL error 0x%x)", error);
+		return NULL;
+	}
 
 	return texture;
 }
@@ -569,6 +643,8 @@ int XGL_UpdateTexture(XGL_Texture *texture, const SDL_Rect *rect, const void *pi
 		SDL_SetError("XGL_UpdateTexture: texture has no owner renderer");
 		return -1;
 	}
+	AVProfile *profile = texture->profile_screen >= 0 ? XGL_activeProfile() : NULL;
+	Uint64 started = profile ? AVProfile_now(profile) : 0;
 	if (XGL_SetCurrentRenderer(texture->owner) != 0) {
 		return -1;
 	}
@@ -581,7 +657,9 @@ int XGL_UpdateTexture(XGL_Texture *texture, const SDL_Rect *rect, const void *pi
 		upload_rect.w = texture->w;
 		upload_rect.h = texture->h;
 	}
-	if (upload_rect.x < 0 || upload_rect.y < 0 || upload_rect.w <= 0 || upload_rect.h <= 0 || upload_rect.x + upload_rect.w > texture->w || upload_rect.y + upload_rect.h > texture->h) {
+	if (upload_rect.x < 0 || upload_rect.y < 0 || upload_rect.w <= 0 || upload_rect.h <= 0 ||
+		upload_rect.x >= texture->w || upload_rect.y >= texture->h ||
+		upload_rect.w > texture->w - upload_rect.x || upload_rect.h > texture->h - upload_rect.y) {
 		SDL_SetError("XGL_UpdateTexture: invalid update rectangle");
 		return -1;
 	}
@@ -591,9 +669,15 @@ int XGL_UpdateTexture(XGL_Texture *texture, const SDL_Rect *rect, const void *pi
 		SDL_SetError("XGL_UpdateTexture: pitch is too small");
 		return -1;
 	}
+	if (texture->access == XGL_TEXTUREACCESS_STREAMING && !texture->lock_pixels) {
+		texture->lock_pitch = texture->w * texture->bytes_per_pixel;
+		texture->lock_pixels = SDL_calloc(texture->h, texture->lock_pitch);
+		if (!texture->lock_pixels) return SDL_OutOfMemory();
+	}
 
 	upload_pixels = (const Uint8 *)pixels;
 	if (pitch != tight_pitch) {
+		Uint64 copy_started = profile && profile->detail ? AVProfile_now(profile) : 0;
 		int y;
 		Uint8 *dst;
 
@@ -607,14 +691,30 @@ int XGL_UpdateTexture(XGL_Texture *texture, const SDL_Rect *rect, const void *pi
 			SDL_memcpy(dst + y * tight_pitch, upload_pixels + y * pitch, (size_t)tight_pitch);
 		}
 		upload_pixels = (const Uint8 *)packed_pixels;
+		if (profile && profile->detail) AVProfile_end(profile, AV_UPLOAD_COPY, copy_started);
 	}
 
 	glBindTexture(GL_TEXTURE_2D, texture->id);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexSubImage2D(GL_TEXTURE_2D, 0, upload_rect.x, upload_rect.y, upload_rect.w, upload_rect.h, texture->gl_format, texture->gl_type, upload_pixels);
+	/* Keep the CPU image consistent even when callers use Update instead of Lock. */
+	if (texture->lock_pixels && pixels != texture->lock_pixels) {
+		Uint64 copy_started = profile && profile->detail ? AVProfile_now(profile) : 0;
+		for (int y = 0; y < upload_rect.h; y++)
+			SDL_memmove((Uint8 *)texture->lock_pixels + (upload_rect.y + y) * texture->lock_pitch +
+				upload_rect.x * texture->bytes_per_pixel,
+				(const Uint8 *)pixels + y * pitch, tight_pitch);
+		if (profile && profile->detail) AVProfile_end(profile, AV_UPLOAD_COPY, copy_started);
+	}
+	texture->ready = SDL_TRUE;
 
 	if (packed_pixels) {
 		SDL_free(packed_pixels);
+	}
+	if (profile) {
+		AVProfile_end(profile, AV_UPLOAD, started);
+		if (profile->detail && texture->profile_screen < 2)
+			AVProfile_end(profile, AV_UPLOAD_TOP + texture->profile_screen, started);
 	}
 	return 0;
 }
@@ -686,15 +786,16 @@ int XGL_LockTexture(XGL_Texture *texture, const SDL_Rect *rect, void **pixels, i
 		SDL_SetError("XGL_LockTexture: texture is already locked");
 		return -1;
 	}
-	if (rect) {
-		SDL_SetError("XGL_LockTexture: partial locks are not supported");
-		return -1;
-	}
+	SDL_Rect area = rect ? *rect : (SDL_Rect){0, 0, texture->w, texture->h};
+	if (area.x < 0 || area.y < 0 || area.w <= 0 || area.h <= 0 ||
+		area.x >= texture->w || area.y >= texture->h ||
+		area.w > texture->w - area.x || area.h > texture->h - area.y)
+		return SDL_SetError("Invalid texture lock rectangle");
 
 	texture->lock_pitch = texture->w * texture->bytes_per_pixel;
 	lock_size = (size_t)texture->lock_pitch * (size_t)texture->h;
 	if (!texture->lock_pixels) {
-		texture->lock_pixels = SDL_malloc(lock_size);
+		texture->lock_pixels = SDL_calloc(1, lock_size);
 		if (!texture->lock_pixels) {
 			SDL_OutOfMemory();
 			return -1;
@@ -702,7 +803,8 @@ int XGL_LockTexture(XGL_Texture *texture, const SDL_Rect *rect, void **pixels, i
 	}
 
 	texture->locked = SDL_TRUE;
-	*pixels = texture->lock_pixels;
+	texture->locked_rect = area;
+	*pixels = (Uint8 *)texture->lock_pixels + area.y * texture->lock_pitch + area.x * texture->bytes_per_pixel;
 	*pitch = texture->lock_pitch;
 	return 0;
 }
@@ -712,8 +814,22 @@ void XGL_UnlockTexture(XGL_Texture *texture) {
 		return;
 	}
 
-	XGL_UpdateTexture(texture, NULL, texture->lock_pixels, texture->lock_pitch);
+	SDL_Rect *area = &texture->locked_rect;
+	void *pixels = (Uint8 *)texture->lock_pixels + area->y * texture->lock_pitch + area->x * texture->bytes_per_pixel;
+	XGL_UpdateTexture(texture, area, pixels, texture->lock_pitch);
 	texture->locked = SDL_FALSE;
+}
+
+void XGL_UnlockTextureDiscard(XGL_Texture *texture) {
+	if (texture) texture->locked = SDL_FALSE;
+}
+
+int XGL_GetTexturePixels(XGL_Texture *texture, const void **pixels, int *pitch) {
+	if (!texture || !pixels || !pitch || texture->locked || !texture->ready || !texture->lock_pixels)
+		return SDL_SetError("No completed CPU texture image");
+	*pixels = texture->lock_pixels;
+	*pitch = texture->lock_pitch;
+	return 0;
 }
 
 XGL_Renderer *XGL_CreateRenderer(SDL_Window *window, SDL_GLContext context) {
@@ -736,6 +852,7 @@ XGL_Renderer *XGL_CreateRenderer(SDL_Window *window, SDL_GLContext context) {
 	renderer->draw_g = 0;
 	renderer->draw_b = 0;
 	renderer->draw_a = 255;
+	renderer->profile_screen = -1;
 
 	if (XGL_SetCurrentRenderer(renderer) != 0 || XGL_UpdateRendererOutputSize(renderer) != 0) {
 		SDL_free(renderer);
@@ -982,6 +1099,10 @@ static int XGL_RenderTexture(XGL_Renderer *renderer, XGL_Texture *texture, const
 		u1 = (GLfloat)(src_rect.x + src_rect.w) / (GLfloat)texture->w;
 		v1 = (GLfloat)(src_rect.y + src_rect.h) / (GLfloat)texture->h;
 	}
+	if (texture->flipped) {
+		v0 = 1.0f - v0;
+		v1 = 1.0f - v1;
+	}
 
 	vertices[0] = (XGL_Vertex){ x0, y0, u0, v0 };
 	vertices[1] = (XGL_Vertex){ x1, y0, u1, v0 };
@@ -994,11 +1115,14 @@ static int XGL_RenderTexture(XGL_Renderer *renderer, XGL_Texture *texture, const
 	glUseProgram(shader->program);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, texture->id);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, shader->linear_filter ? GL_LINEAR : GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, shader->linear_filter ? GL_LINEAR : GL_NEAREST);
+	GLenum filter = shader->linear_filter ? GL_LINEAR : GL_NEAREST;
+	if (texture->filter != filter) {
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+		texture->filter = filter;
+	}
 	if (mode==XGL_RENDER_REPEAT) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		XGL_SetTextureRepeat(texture, SDL_TRUE);
 	}
 	glUniform1i(shader->uniform_texture, 0);
 	glUniform2f(shader->uniform_view_size, (GLfloat)renderer->output_w, (GLfloat)renderer->output_h);
@@ -1014,6 +1138,26 @@ static int XGL_RenderTexture(XGL_Renderer *renderer, XGL_Texture *texture, const
 	}
 	if (shader->uniform_source_pos >= 0) {
 		glUniform2f(shader->uniform_source_pos, (GLfloat)src_rect.x, (GLfloat)src_rect.y);
+	}
+	if (shader->uniform_grid_enabled >= 0) {
+		XGL_Texture *grid = shader->grid;
+		glUniform1i(shader->uniform_grid_enabled, grid != NULL);
+		if (grid) {
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, grid->id);
+			if (grid->filter != GL_NEAREST) {
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+				grid->filter = GL_NEAREST;
+			}
+			XGL_SetTextureRepeat(grid, SDL_TRUE);
+			glUniform1i(shader->uniform_grid, 1);
+			glUniform2f(shader->uniform_grid_size, grid->w, grid->h);
+			glUniform1f(shader->uniform_grid_height, renderer->output_h);
+			glUniform4f(shader->uniform_grid_color, grid->color_r / 255.0f,
+				grid->color_g / 255.0f, grid->color_b / 255.0f, grid->alpha / 255.0f);
+			glActiveTexture(GL_TEXTURE0);
+		}
 	}
 
 	if (texture->blend_mode == SDL_BLENDMODE_BLEND || texture->alpha < 255) {
@@ -1034,8 +1178,7 @@ static int XGL_RenderTexture(XGL_Renderer *renderer, XGL_Texture *texture, const
 	glDisableVertexAttribArray(shader->attr_texcoord);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (mode==XGL_RENDER_REPEAT) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		XGL_SetTextureRepeat(texture, SDL_FALSE);
 	}
 
 	return 0;
@@ -1116,6 +1259,10 @@ int XGL_RenderReadPixels(XGL_Renderer *renderer, const SDL_Rect *rect, Uint32 fo
 
 void XGL_RenderPresent(XGL_Renderer *renderer) {
 	if (XGL_SetCurrentRenderer(renderer) == 0) {
+		AVProfile *profile = XGL_activeProfile();
+		Uint64 started = profile && profile->detail ? AVProfile_now(profile) : 0;
 		SDL_GL_SwapWindow(renderer->window);
+		if (profile && profile->detail && renderer->profile_screen >= 0 && renderer->profile_screen < 2)
+			AVProfile_end(profile, AV_SWAP_TOP + renderer->profile_screen, started);
 	}
 }

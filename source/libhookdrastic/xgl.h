@@ -2,6 +2,7 @@
 #define XGL_H
 
 #include <SDL2/SDL.h>
+#include "avprofile.h"
 
 typedef enum XGL_TextureAccess {
 	XGL_TEXTUREACCESS_STATIC,
@@ -14,6 +15,9 @@ typedef struct XGL_Texture XGL_Texture;
 
 int XGL_Init(void);
 void XGL_Quit(void);
+void XGL_SetProfile(AVProfile *profile);
+void XGL_SetProfileScreen(XGL_Renderer *renderer, int screen);
+void XGL_SetTextureProfileScreen(XGL_Texture *texture, int screen);
 
 XGL_Renderer *XGL_CreateRenderer(SDL_Window *window, SDL_GLContext context);
 void XGL_DestroyRenderer(XGL_Renderer *renderer);
@@ -29,6 +33,8 @@ int XGL_SetTextureAlphaMod(XGL_Texture *texture, Uint8 alpha);
 int XGL_UpdateTexture(XGL_Texture *texture, const SDL_Rect *rect, const void *pixels, int pitch);
 int XGL_LockTexture(XGL_Texture *texture, const SDL_Rect *rect, void **pixels, int *pitch);
 void XGL_UnlockTexture(XGL_Texture *texture);
+/* Release a streaming lock without transferring its CPU pixels to GL. */
+void XGL_UnlockTextureDiscard(XGL_Texture *texture);
 
 XGL_Shader *XGL_CreateShader(XGL_Renderer *renderer, const char *vertex_source, const char *fragment_source);
 XGL_Shader *XGL_CreateLinearShader(XGL_Renderer *renderer);
@@ -37,12 +43,16 @@ XGL_Shader *XGL_CreateGridShader(XGL_Renderer *renderer);
 void XGL_DestroyShader(XGL_Shader *shader);
 XGL_Shader *XGL_GetDefaultTextureShader(XGL_Renderer *renderer);
 int XGL_SetRenderShader(XGL_Renderer *renderer, XGL_Shader *shader);
+/* Fuse the repeating grid into the final game draw; NULL disables it. */
+int XGL_SetShaderGrid(XGL_Shader *shader, XGL_Texture *grid);
 
 int XGL_SetRenderDrawColor(XGL_Renderer *renderer, Uint8 r, Uint8 g, Uint8 b, Uint8 a);
 int XGL_RenderClear(XGL_Renderer *renderer);
 int XGL_RenderFillRect(XGL_Renderer *renderer, const SDL_Rect *rect);
 int XGL_RenderFillRects(XGL_Renderer *renderer, const SDL_Rect *rects, int count);
 int XGL_RenderCopy(XGL_Renderer *renderer, XGL_Texture *texture, const SDL_Rect *src, const SDL_Rect *dst);
+/* Borrow the last completed streaming image, without uploading it again. */
+int XGL_GetTexturePixels(XGL_Texture *texture, const void **pixels, int *pitch);
 int XGL_RenderRepeat(XGL_Renderer *renderer, XGL_Texture *texture, const SDL_Rect *dst);
 int XGL_RenderReadPixels(XGL_Renderer *renderer, const SDL_Rect *rect, Uint32 format, void *pixels, int pitch);
 void XGL_RenderPresent(XGL_Renderer *renderer);

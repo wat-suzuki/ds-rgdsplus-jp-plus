@@ -1,42 +1,43 @@
-# DEDICATED OS
+[English](README.md) | [日本語](README.ja.md)
 
-DEDICATED OS is a cluster of hyper-focused, single-system launchers for specific devices. This version is for playing Nintendo DS on the Anbernic RG DS Plus.
+# DS RGDSPLUS JP+
 
-This is what it looks like:
+An unofficial Japanese-language adaptation of [DEDICATED OS for RG DS Plus](https://github.com/dedicated-os/dedicated-rgds-plus). This project is based on and intended to complement the original work by its author.
 
-<img width=256 src="github/dedicated-menu.png" title=Menu /> <img width=256 src="github/dedicated-archive.png" title=Archive /> 
+It adds Japanese game title display and a shortcut to switch Hi-Res mode on or off.
 
-That's it. You can [grab the latest version here](https://github.com/dedicated-os/dedicated-rgds-plus/releases).
+## Installation
 
-## Features
+The RG DS Plus uses two SD cards. Use the original system image on TF1/INT, and install the launcher package on TF2/EXT.
 
-- no options
-- single save state per game (see below)
-- fast game switcher
-- modified drastic for emulation
-- silent fast forward
-- native lid support
-- native mic support
-- datetime and timezone switcher
-- archive for hiding completed or unstarted games
-- automatic save on poweroff and when switching games
-- automatic resume on boot and when switching games
-- faux sleep with automatic poweroff
+### Fresh installation
 
-## Usage
+1. Download the original `main-rgds-plus` system image from the [official releases](https://github.com/dedicated-os/main-rgds-plus/releases) and write it to the TF1/INT card, following the [original project instructions](https://github.com/dedicated-os/dedicated-rgds-plus).
+2. Prepare the TF2/EXT card as described by the original project.
+3. Download the latest JP+ package from this repository's [Releases](../../releases), extract it, and copy its contents to the root of TF2/EXT.
+4. Put your games in `/games/` on TF2/EXT, then insert both cards and start the device.
 
-Press the Anbernic/MENU button to open the in-game menu where you can save, load, and reset the current game or switch to and load or reset a different game. 
+### Updating JP+
 
-Press MENU again to open the system menu where you can manage your archive and set the date, time, and timezone.
+1. Download and extract the latest JP+ package from [Releases](../../releases).
+2. Copy `system.zip`, `bootlogo-0.bmp`, and `bootlogo-1.bmp` to the root of TF2/EXT, replacing the existing files.
+3. Start the device. The system update is applied during startup.
 
-To recover a manual save that was replaced by an automatic save, press the SELECT button while LOAD is highlighted in the in-game menu to switch to the manual save, then press A to load it.
+## Controls
 
-Lid events are automatically sent directly to the running game. Games that require the microphone automatically use the microphone.
+Press the device's **MENU** button to open the in-game menu. Press it again to open the system menu.
 
-## Known Issues
+| Action | Shortcut |
+| :--- | :--- |
+| Toggle Hi-Res mode | `MENU + START` |
+| Swap the top and bottom screens | `MENU + SELECT` |
+| Toggle the screen grid | `MENU + L2` |
+| Save a screenshot | `MENU + A` |
+| Adjust brightness | `MENU + Volume + / Volume -` |
+| Fast-forward | `BACK` |
 
-Some DS games hang in drastic when the lid is closed (eg. Monster Tale, Radiant Historia, Ni no Kuni). These games are blocked from lid support. They will instead enter or exit faux sleep instead of receiving lid events. If you encounter another game that freezes when the lid is closed, let me know so I can add them to the blocklist.
+Changing Hi-Res mode saves the current game, restarts DraStic, and resumes the game automatically.
 
-## Original RG DS Support
+## Credits
 
-The original RG DS is unsupported, its 640x480 screens were a mistake and I won't dignify it with a release.
+DEDICATED OS for RG DS Plus is created and maintained by [shauninman](https://github.com/dedicated-os/dedicated-rgds-plus). Please see the [original project](https://github.com/dedicated-os/dedicated-rgds-plus) for its documentation and licensing.
