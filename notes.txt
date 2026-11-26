@@ -38,14 +38,14 @@ then in Cutter find sym.quit, show Xrefs, and trace its args up through the call
 ----------------------------------------
 
 # Updating
-1. Download the `dedicated-rgds-plus` zip below and unzip.
+1. Download the monoDS RG DS Plus package below and unzip.
 2. Copy `system.zip` to the root of your TF2/EXT SD card.
 3. Eject and insert the card back into the TF2/EXT slot.
 
 # Installing
-1. Download the latest [main-rgds-plus][main] image.
+1. Download the latest upstream [main-rgds-plus][main] image.
 2. Flash the image to a small SD card. Insert into the TF1/INT slot.
-3. Download the `dedicated-rgds-plus` zip below.
+3. Download the monoDS RG DS Plus package below.
 4. Format a larger SD card as FAT32 (MBR not GPT).
 5. Unzip the downloaded zip file and copy its contents to the root of the freshly formatted SD card.
 6. Add your games and bios to the SD card (the games you won't be playing immediately can go in `/games/archive` to hide them for now). Insert into the TF2/EXT slot.
@@ -58,4 +58,4 @@ then in Cutter find sym.quit, show Xrefs, and trace its args up through the call
 ----------------------------------------
 
 > [!CAUTION]
-> This release is out of date. [Download the latest instead.](https://github.com/dedicated-os/dedicated-rgds-plus/releases/latest)
+> The upstream project is available from [its official releases](https://github.com/dedicated-os/dedicated-rgds-plus/releases/latest).

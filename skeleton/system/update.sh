@@ -30,5 +30,6 @@ set -e
 		done
 		rm "$STATE_PATH"
 	done
-	rm -rf "$SHOTS_PATH"
+	# Leave unrelated screenshots in place; remove only an empty legacy folder.
+	rmdir "$SHOTS_PATH" 2>/dev/null || :
 }

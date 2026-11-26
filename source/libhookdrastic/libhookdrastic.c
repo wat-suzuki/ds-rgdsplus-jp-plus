@@ -136,6 +136,8 @@ static void Paths_init(void) {
 
 #define DS_WIDTH 256
 #define DS_HEIGHT 192
+#define FILTER_MAX_WIDTH (DS_WIDTH * 2)
+#define FILTER_MAX_HEIGHT (DS_HEIGHT * 2)
 #define DRM_OVERLAY_BUFFERS 3
 
 typedef struct {
@@ -226,6 +228,9 @@ static int drm_overlay_mode;
 
 typedef struct {
 	XGL_Texture *texture;
+	XGL_Texture *scale2x_texture;
+	int scale2x_width, scale2x_height;
+	int scale2x_failed;
 	int claimed;
 	int width, height;
 	Uint32 format;
@@ -237,6 +242,96 @@ typedef struct {
 	const void *completed_pixels;
 	int completed_pitch;
 } DummyTexture;
+
+static int Game_scalePasses(const DummyTexture *game);
+
+/* Compare RGB only: DraStic's streaming alpha bytes are unreliable.
+ * Use memcpy for scalar accesses so padded and unaligned rows are supported. */
+static inline Uint32 Scale2x_pixel(const Uint8 *pixel) {
+	Uint32 color;
+	memcpy(&color, pixel, sizeof(color));
+	return color | 0xff000000u;
+}
+
+static inline void Scale2x_writePixel(const Uint8 *above, const Uint8 *row,
+	const Uint8 *below, Uint8 *top, Uint8 *bottom, int x, int width) {
+	Uint32 b = Scale2x_pixel(above + x * 4);
+	Uint32 d = Scale2x_pixel(row + (x > 0 ? x - 1 : x) * 4);
+	Uint32 e = Scale2x_pixel(row + x * 4);
+	Uint32 f = Scale2x_pixel(row + (x + 1 < width ? x + 1 : x) * 4);
+	Uint32 h = Scale2x_pixel(below + x * 4);
+	Uint32 upper[2] = {e, e}, lower[2] = {e, e};
+	if (b != h && d != f) {
+		upper[0] = d == b ? d : e;
+		upper[1] = b == f ? f : e;
+		lower[0] = d == h ? d : e;
+		lower[1] = h == f ? f : e;
+	}
+	memcpy(top + x * 8, upper, sizeof(upper));
+	memcpy(bottom + x * 8, lower, sizeof(lower));
+}
+
+/* Standard Scale2x, with clamped edges and a four-source-pixel NEON loop.
+ * Source and destination must be separate, positive-size 32-bit images. */
+static void Scale2x_copy(const void *pixels, int pitch, void *destination,
+	int destination_pitch, int width, int height) {
+	for (int y = 0; y < height; y++) {
+		const Uint8 *row = (const Uint8 *)pixels + (size_t)y * pitch;
+		const Uint8 *above = y > 0 ? row - pitch : row;
+		const Uint8 *below = y + 1 < height ? row + pitch : row;
+		Uint8 *top = (Uint8 *)destination + (size_t)y * 2 * destination_pitch;
+		Uint8 *bottom = top + destination_pitch;
+		Scale2x_writePixel(above, row, below, top, bottom, 0, width);
+		int x = 1;
+#if defined(__ARM_NEON)
+		uint32x4_t opaque = vdupq_n_u32(0xff000000u);
+		for (; x + 4 < width; x += 4) {
+			uint32x4_t b = vorrq_u32(vreinterpretq_u32_u8(vld1q_u8(above + x * 4)), opaque);
+			uint32x4_t d = vorrq_u32(vreinterpretq_u32_u8(vld1q_u8(row + (x - 1) * 4)), opaque);
+			uint32x4_t e = vorrq_u32(vreinterpretq_u32_u8(vld1q_u8(row + x * 4)), opaque);
+			uint32x4_t f = vorrq_u32(vreinterpretq_u32_u8(vld1q_u8(row + (x + 1) * 4)), opaque);
+			uint32x4_t h = vorrq_u32(vreinterpretq_u32_u8(vld1q_u8(below + x * 4)), opaque);
+			uint32x4_t edge = vandq_u32(vmvnq_u32(vceqq_u32(b, h)), vmvnq_u32(vceqq_u32(d, f)));
+			uint32x4x2_t upper = {{
+				vbslq_u32(vandq_u32(edge, vceqq_u32(d, b)), d, e),
+				vbslq_u32(vandq_u32(edge, vceqq_u32(b, f)), f, e)
+			}};
+			uint32x4x2_t lower = {{
+				vbslq_u32(vandq_u32(edge, vceqq_u32(d, h)), d, e),
+				vbslq_u32(vandq_u32(edge, vceqq_u32(h, f)), f, e)
+			}};
+			vst2q_u32((Uint32 *)(top + x * 8), upper);
+			vst2q_u32((Uint32 *)(bottom + x * 8), lower);
+		}
+#endif
+		for (; x < width; x++)
+			Scale2x_writePixel(above, row, below, top, bottom, x, width);
+	}
+}
+
+static void Game_resetScale2x(DummyTexture *game) {
+	XGL_DestroyTexture(game->scale2x_texture);
+	game->scale2x_texture = NULL;
+	game->scale2x_width = game->scale2x_height = 0;
+	game->scale2x_failed = 0;
+}
+
+/* Write Scale2x directly into the DRM buffer or XGL texture lock. */
+static int Game_filterCopy(DummyTexture *game, void *destination, int pitch) {
+	int passes = Game_scalePasses(game);
+	if (!game->completed_pixels || !destination || game->width <= 0 || game->height <= 0 ||
+		game->width > DS_WIDTH * 2 || game->height > DS_HEIGHT * 2 ||
+		game->completed_pitch < game->width * 4 || pitch < (game->width << passes) * 4)
+		return SDL_SetError("Invalid game filter image or pitch");
+	const void *pixels = game->completed_pixels;
+	int source_pitch = game->completed_pitch;
+	int width = game->width, height = game->height;
+	if (passes) Scale2x_copy(pixels, source_pitch, destination, pitch, width, height);
+	else for (int y = 0; y < height; y++)
+		memcpy((Uint8 *)destination + (size_t)y * pitch,
+			(const Uint8 *)pixels + (size_t)y * source_pitch, (size_t)width * 4);
+	return 0;
+}
 
 typedef struct {
 	SDL_Window *window;
@@ -333,7 +428,7 @@ static void Profile_suspend(void) {
 
 static void dmesg(const char *msg) {
 	char buffer[MAX_LINE];
-	snprintf(buffer, sizeof(buffer), "<6>dedicated: %s\n", msg);
+	snprintf(buffer, sizeof(buffer), "<6>monoDS: %s\n", msg);
 	int fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
 	if (fd<0) return;
 	write(fd, buffer, strlen(buffer));
@@ -833,12 +928,12 @@ static void raw_drm_overlay_cleanup(void) {
 }
 
 static int raw_drm_overlay_create_buffer(DrmOverlayBuffer *buffer) {
-	if (raw_drm_create_dumb_buffer(drm_overlay.fd, DS_WIDTH * 2, DS_HEIGHT * 2, 32,
+	if (raw_drm_create_dumb_buffer(drm_overlay.fd, FILTER_MAX_WIDTH, FILTER_MAX_HEIGHT, 32,
 		&buffer->handle, &buffer->pitch, &buffer->size) != 0) return -1;
 	uint32_t handles[4] = {buffer->handle, 0, 0, 0};
 	uint32_t pitches[4] = {buffer->pitch, 0, 0, 0};
 	uint32_t offsets[4] = {0, 0, 0, 0};
-	if (drmModeAddFB2(drm_overlay.fd, DS_WIDTH * 2, DS_HEIGHT * 2, DRM_FORMAT_XRGB8888,
+	if (drmModeAddFB2(drm_overlay.fd, FILTER_MAX_WIDTH, FILTER_MAX_HEIGHT, DRM_FORMAT_XRGB8888,
 		handles, pitches, offsets, &buffer->framebuffer, 0) != 0) return -1;
 	struct drm_mode_map_dumb map = {.handle = buffer->handle};
 	if (ioctl(drm_overlay.fd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0) return -1;
@@ -975,7 +1070,7 @@ static int raw_drm_overlay_init(SDL_Window *window) {
 	for (int s = 0; test && s < SCREEN_COUNT; s++) {
 		DrmOverlayBuffer *buffer = &drm_overlay.buffers[s][0];
 		const uint64_t values[10] = {buffer->framebuffer, drm_overlay.crtc[s], 0, 0,
-			(uint64_t)(DS_WIDTH * 2) << 16, (uint64_t)(DS_HEIGHT * 2) << 16,
+			(uint64_t)FILTER_MAX_WIDTH << 16, (uint64_t)FILTER_MAX_HEIGHT << 16,
 			0, 0, drm_overlay.output_w[s], drm_overlay.output_h[s]};
 		for (int p = 0; p < 10; p++)
 			if (drmModeAtomicAddProperty(test, drm_overlay.plane[s], drm_overlay.property[s][p], values[p]) < 0)
@@ -989,7 +1084,8 @@ static int raw_drm_overlay_init(SDL_Window *window) {
 		SDL_Log("DRM overlay: allocated-buffer TEST_ONLY failed: %s", strerror(errno));
 		goto fail;
 	}
-	SDL_Log("DRM overlay: buffers ready; source=512x384 output=1024x768 buffers=%d", DRM_OVERLAY_BUFFERS);
+	SDL_Log("DRM overlay: buffers ready; maximum source=%dx%d output=1024x768 buffers=%d",
+		FILTER_MAX_WIDTH, FILTER_MAX_HEIGHT, DRM_OVERLAY_BUFFERS);
 	return 0;
 fail:
 	raw_drm_overlay_cleanup();
@@ -999,6 +1095,7 @@ fail:
 
 static int raw_drm_overlay_present(void) {
 	DrmOverlayBuffer *selected[SCREEN_COUNT];
+	int source_width[SCREEN_COUNT], source_height[SCREEN_COUNT];
 	for (int s = 0; s < SCREEN_COUNT; s++) {
 		int source = s ^ app.screen_swap;
 		DummyTexture *game = &app.dummy.screens[source];
@@ -1009,12 +1106,16 @@ static int raw_drm_overlay_present(void) {
 			return -1;
 		}
 		selected[s] = &drm_overlay.buffers[s][drm_overlay.next[s]++ % DRM_OVERLAY_BUFFERS];
-		if (selected[s]->pitch < (uint32_t)game->width * 4) return -1;
+		int passes = Game_scalePasses(game);
+		source_width[s] = game->width << passes;
+		source_height[s] = game->height << passes;
+		if (selected[s]->pitch < (uint32_t)source_width[s] * 4 ||
+			selected[s]->size < (uint64_t)selected[s]->pitch * source_height[s]) return -1;
 		Uint64 copy_started = AVProfile_now(&av_profile);
-		for (int y = 0; y < game->height; y++)
-			memcpy((Uint8 *)selected[s]->pixels + (size_t)y * selected[s]->pitch,
-				(const Uint8 *)game->completed_pixels + (size_t)y * game->completed_pitch,
-				(size_t)game->width * 4);
+		if (Game_filterCopy(game, selected[s]->pixels, selected[s]->pitch) != 0) {
+			SDL_Log("DRM overlay: filter failed; reverting to XGL: %s", SDL_GetError());
+			return -1;
+		}
 		if (av_profile.enabled) {
 			AVProfile_end(&av_profile, AV_UPLOAD, copy_started);
 			if (av_profile.detail) AVProfile_end(&av_profile, AV_UPLOAD_TOP + s, copy_started);
@@ -1025,9 +1126,8 @@ static int raw_drm_overlay_present(void) {
 	int failed = 0;
 	for (int s = 0; s < SCREEN_COUNT; s++) {
 		DrmOverlayBuffer *buffer = selected[s];
-		DummyTexture *game = &app.dummy.screens[s ^ app.screen_swap];
 		const uint64_t values[10] = {buffer->framebuffer, drm_overlay.crtc[s], 0, 0,
-			(uint64_t)game->width << 16, (uint64_t)game->height << 16,
+			(uint64_t)source_width[s] << 16, (uint64_t)source_height[s] << 16,
 			0, 0, drm_overlay.output_w[s], drm_overlay.output_h[s]};
 		for (int p = 0; p < 10; p++)
 			if (drmModeAtomicAddProperty(request, drm_overlay.plane[s], drm_overlay.property[s][p], values[p]) < 0)
@@ -1251,8 +1351,12 @@ static void raw_ip(char *out) {
 // --------------------------------------------
 
 typedef enum {
-	DISPLAY_OFF, DISPLAY_HIRES, DISPLAY_MODE_COUNT
+	DISPLAY_OFF, DISPLAY_SCALE2X, DISPLAY_HIRES, DISPLAY_MODE_COUNT
 } DisplayMode;
+
+static int DisplayMode_isHires(int mode) {
+	return mode == DISPLAY_HIRES;
+}
 
 static int Config_get_hires_3d(void);
 static int Config_set_hires_3d(int enabled);
@@ -1262,7 +1366,7 @@ static void ScreenSwap_toggle(void);
 static Uint32 display_notice_at;
 static int display_notice_pending = 1, display_notice_active;
 static const char *DisplayMode_label(int mode) {
-	static const char *labels[] = {"Off", "Hi-Res"};
+	static const char *labels[] = {"Off", "Scale2x", "Hi-Res"};
 	return mode >= 0 && mode < DISPLAY_MODE_COUNT ? labels[mode] : labels[0];
 }
 
@@ -1275,11 +1379,18 @@ static struct {
 	int unused[3];
 	char game[MAX_PATH];
 } settings = {
-	.version = 2,
+	.version = 5,
 	.volume = 10,
 	.brightness = 5,
-	.grid = 1,
+	.grid = 0,
 };
+
+static int Game_scalePasses(const DummyTexture *game) {
+	if (SDL_BYTESPERPIXEL(game->format) != 4) return 0;
+	int native = game->width == DS_WIDTH && game->height == DS_HEIGHT;
+	if (native && settings.display_mode == DISPLAY_SCALE2X) return 1;
+	return 0;
+}
 
 static void Settings_load(void) {
 	settings.display_mode = Config_get_hires_3d() ? DISPLAY_HIRES : DISPLAY_OFF;
@@ -1288,11 +1399,24 @@ static void Settings_load(void) {
 	__typeof__(settings) loaded = {0};
 	int valid = fread(&loaded, sizeof(loaded), 1, file) == 1;
 	fclose(file);
-	if (!valid || loaded.version < 1 || loaded.version > 2) return;
-	// The config is authoritative. In older builds mode 1 meant x4, so
-	// interpreting the saved field after removing x4 could enable Hi-Res.
-	loaded.display_mode = settings.display_mode;
-	loaded.version = 2;
+	if (!valid || loaded.version < 1 || loaded.version > 5) return;
+	// drastic.cfg remains authoritative for internal resolution. Version 5
+	// keeps only Off, Scale2x, and Hi-Res; map the removed v4 filters to the
+	// nearest remaining mode.
+	int mode = settings.display_mode;
+	if (loaded.version == 5 && loaded.display_mode >= DISPLAY_OFF &&
+		loaded.display_mode < DISPLAY_MODE_COUNT &&
+		DisplayMode_isHires(loaded.display_mode) == DisplayMode_isHires(mode))
+		mode = loaded.display_mode;
+	else if (loaded.version == 4) {
+		if (DisplayMode_isHires(mode)) mode = DISPLAY_HIRES;
+		else if (loaded.display_mode == 1 || loaded.display_mode == 2) mode = DISPLAY_SCALE2X;
+		else mode = DISPLAY_OFF;
+	}
+	else if (loaded.version == 3 && mode == DISPLAY_OFF && loaded.display_mode == DISPLAY_SCALE2X)
+		mode = DISPLAY_SCALE2X;
+	loaded.display_mode = mode;
+	loaded.version = 5;
 	loaded.game[sizeof(loaded.game) - 1] = '\0';
 	if (loaded.volume < 0 || loaded.volume > 20) loaded.volume = settings.volume;
 	if (loaded.brightness < 0 || loaded.brightness > 10) loaded.brightness = settings.brightness;
@@ -1877,7 +2001,7 @@ static void drastic_await_save(void) {
 static void drastic_load_nds_and_jump(const char* path) {
 	Profile_suspend();
 	drastic_await_save();
-	if (!Config_set_hires_3d(settings.display_mode == DISPLAY_HIRES))
+	if (!Config_set_hires_3d(DisplayMode_isHires(settings.display_mode)))
 		SDL_Log("Could not update Hi-Res config before ROM reset");
 
 	Mic_quit();
@@ -3011,8 +3135,8 @@ static int Device_handleEvent(SDL_Event* event) {
 	}
 	
 	if (Pad_isPressed(PAD_MENU)) {
-		if (Pad_justPressed(PAD_L2)) {
-			Pad_consume(PAD_L2);
+		if (Pad_justPressed(PAD_R2)) {
+			Pad_consume(PAD_R2);
 			settings.grid = !settings.grid;
 			menu_combo = 1;
 			return 1;
@@ -3261,14 +3385,53 @@ static void App_preview(int game, int screen, int snap) {
 
 	SDL_FreeSurface(tmp);
 }
+static int App_capturePath(char *path) {
+	char title[MAX_FILE];
+	size_t length = 0;
+	for (const unsigned char *c = (const unsigned char *)app.game_name;
+		*c && length < sizeof(title) - 1; c++)
+		title[length++] = *c < 0x20 || strchr("\\/:*?\"<>|", *c) ? '_' : (char)*c;
+	while (length && (title[length - 1] == ' ' || title[length - 1] == '.')) length--;
+	if (!length) {
+		memcpy(title, "screenshot", sizeof("screenshot"));
+		length = sizeof("screenshot") - 1;
+	} else {
+		title[length] = '\0';
+	}
+	char directory[MAX_PATH];
+	Path_concat(directory, paths.userdata, "/screenshots");
+	if (mkdir(directory, 0755) != 0 && errno != EEXIST) return 0;
+	for (unsigned int serial = 1; serial <= 999999; serial++) {
+		if (snprintf(path, MAX_PATH, "%s/%s-%04u.bmp", directory, title, serial) >= MAX_PATH) return 0;
+		if (!exists(path)) return 1;
+	}
+	return 0;
+}
 static void App_capture(const char *name) {
+	(void)name;
 	char path[MAX_PATH];
-	sprintf(path, "/tmp/capture-%s.bmp", name);
-	SDL_Surface *tmp = SDL_CreateRGBSurfaceWithFormat(0, SCREEN_WIDTH, SCREEN_HEIGHT*2, 32, SDL_PIXELFORMAT_ARGB8888);
-	XGL_RenderReadPixels(app.xgl.renderers[0], NULL, SDL_PIXELFORMAT_ARGB8888, tmp->pixels, tmp->pitch);
-	XGL_RenderReadPixels(app.xgl.renderers[1], NULL, SDL_PIXELFORMAT_ARGB8888, tmp->pixels + (SCREEN_HEIGHT*tmp->pitch), tmp->pitch);
-	SDL_SaveBMP(tmp, path);
-	SDL_FreeSurface(tmp);
+	if (!App_capturePath(path)) {
+		SDL_Log("Snapshot failed: could not allocate a screenshot filename");
+		app.capture = 0;
+		return;
+	}
+	SDL_Surface *snapshot = SDL_CreateRGBSurfaceWithFormat(0, SCREEN_WIDTH, SCREEN_HEIGHT * 2,
+		32, SDL_PIXELFORMAT_ARGB8888);
+	if (!snapshot) {
+		SDL_Log("Snapshot failed: %s", SDL_GetError());
+		app.capture = 0;
+		return;
+	}
+	int top = XGL_RenderReadPixels(app.xgl.renderers[0], NULL, SDL_PIXELFORMAT_ARGB8888,
+		snapshot->pixels, snapshot->pitch);
+	int bottom = XGL_RenderReadPixels(app.xgl.renderers[1], NULL, SDL_PIXELFORMAT_ARGB8888,
+		(Uint8 *)snapshot->pixels + (size_t)SCREEN_HEIGHT * snapshot->pitch, snapshot->pitch);
+	if (top == 0 && bottom == 0) {
+		if (SDL_SaveBMP(snapshot, path) != 0) SDL_Log("Snapshot failed: %s", SDL_GetError());
+	} else {
+		SDL_Log("Snapshot failed: %s", SDL_GetError());
+	}
+	SDL_FreeSurface(snapshot);
 	app.capture = 0;
 }
 static void App_load(int slot) {
@@ -3284,14 +3447,14 @@ static int App_save(int slot) {
 static void DisplayMode_cycle(void) {
 	DisplayMode before = settings.display_mode;
 	DisplayMode next = (before + 1) % DISPLAY_MODE_COUNT;
-	int restart = (before == DISPLAY_HIRES) != (next == DISPLAY_HIRES);
+	int restart = DisplayMode_isHires(before) != DisplayMode_isHires(next);
 	if (restart) {
 		if (!App_save(STATE_AUTO)) {
 			SDL_Log("Could not save state; keeping display mode %s", DisplayMode_label(before));
 			return;
 		}
 		drastic_await_save();
-		if (!Config_set_hires_3d(next == DISPLAY_HIRES)) {
+		if (!Config_set_hires_3d(DisplayMode_isHires(next))) {
 			SDL_Log("Could not update Hi-Res config; keeping current mode");
 			return;
 		}
@@ -3299,7 +3462,7 @@ static void DisplayMode_cycle(void) {
 	settings.display_mode = next;
 	if (!Settings_save()) {
 		settings.display_mode = before;
-		if (restart) Config_set_hires_3d(before == DISPLAY_HIRES);
+		if (restart) Config_set_hires_3d(DisplayMode_isHires(before));
 		SDL_Log("Could not save display mode; keeping %s", DisplayMode_label(before));
 		return;
 	}
@@ -3307,6 +3470,8 @@ static void DisplayMode_cycle(void) {
 		restart ? "; saving and restarting" : "");
 	display_notice_pending = 1;
 	display_notice_active = 0;
+	if (next == DISPLAY_SCALE2X)
+		for (int i = 0; i < SCREEN_COUNT; i++) app.dummy.screens[i].scale2x_failed = 0;
 	if (restart) drastic_quit();
 }
 static void App_reset(void) {
@@ -3705,7 +3870,7 @@ static void App_hud(int hud) {
 	XGL_Renderer *renderer = app.xgl.renderers[0];
 	
 	if (hud) {
-		Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
+		Font_shadowText(renderer, font24, "monoDS RGDS+", 20,20, LIGHT_COLOR);
 		
 		char name[MAX_FILE];
 		App_getDisplayName(app.items[ui.current].name, name);
@@ -3755,7 +3920,7 @@ static void App_bye(void) {
 		
 		if (i==0) {
 			App_battery(renderer, battery,is_charging,1);	
-			Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
+			Font_shadowText(renderer, font24, "monoDS RGDS+", 20,20, LIGHT_COLOR);
 			const char* message = "Saving & shutting down...";
 			int message_width = 0;
 			Font_getTextSize(font24, message, &message_width, NULL);
@@ -3785,7 +3950,7 @@ static void App_empty(void) {
 		
 		if (i==0) {
 			App_battery(renderer, battery,is_charging,1);	
-			Font_shadowText(renderer, font24, "DS RGDSPLUS JP+", 20,20, LIGHT_COLOR);
+			Font_shadowText(renderer, font24, "monoDS RGDS+", 20,20, LIGHT_COLOR);
 			Font_shadowText(renderer, font36, "No games found", 20, 56, WHITE_COLOR);
 		}
 
@@ -4079,6 +4244,7 @@ static void App_quit(void) {
 	// Drastic never destroys renderers or windows; release shared contexts only after all renderers.
 	for (int i=0; i<SCREEN_COUNT; i++) {
 		XGL_DestroyShader(app.xgl.game_shaders[i]);
+		Game_resetScale2x(&app.dummy.screens[i]);
 		XGL_DestroyTexture(app.xgl.screens[i]);
 		XGL_DestroyRenderer(app.xgl.renderers[i]);
 	}
@@ -5036,6 +5202,9 @@ static void App_system(void) {
 			for (int i=0; i<count; i++) {
 				Font_renderFunc font_renderer = Font_shadowText;
 				SDL_Color color = WHITE_COLOR;
+				int text_height = 0;
+				Font_getTextSize(font24, MenuItem_getName(items[i]), NULL, &text_height);
+				int text_y = y + (i * oh) + (36 - text_height) / 2 - font24->offset_y;
 				
 				if (i==selected) {
 					AA_rect(renderer, x+2,y+(i*oh)+2,w,36, 0, TRIAD_ALPHA(BLACK_TRIAD,0xff));
@@ -5044,7 +5213,7 @@ static void App_system(void) {
 					color = DARK_COLOR;
 				}
 				
-				font_renderer(renderer, font24, MenuItem_getName(items[i]), x+8, y+8+(i*oh), color);
+				font_renderer(renderer, font24, MenuItem_getName(items[i]), x+8, text_y, color);
 			}
 			
 			if (ip[0]) {
@@ -5258,6 +5427,9 @@ static void App_menu(void) {
 			for (int i=0; i<count; i++) {
 				Font_renderFunc font_renderer = Font_shadowText;
 				SDL_Color color = WHITE_COLOR;
+				int text_height = 0;
+				Font_getTextSize(font24, MenuItem_getName(items[i]), NULL, &text_height);
+				int text_y = y + (i * oh) + (36 - text_height) / 2 - font24->offset_y;
 
 				if (i==selected) {
 					AA_rect(renderer, x+2,y+(i*oh)+2,w,36, 0, TRIAD_ALPHA(BLACK_TRIAD,0xff));
@@ -5266,7 +5438,7 @@ static void App_menu(void) {
 					color = DARK_COLOR;
 				}
 
-				font_renderer(renderer, font24, MenuItem_getName(items[i]), x+8, y+8+(i*oh), color);
+				font_renderer(renderer, font24, MenuItem_getName(items[i]), x+8, text_y, color);
 			}
 			
 			// if (toggleable) {
@@ -5331,6 +5503,43 @@ static void drm_overlay_sync_xgl_textures(void) {
 	}
 }
 
+/* UI, grid and screenshot frames temporarily use XGL instead of DRM. Keep
+ * the same CPU filter there, while preserving the native texture for saves. */
+static XGL_Texture *Game_displayTexture(int source) {
+	DummyTexture *game = &app.dummy.screens[source];
+	int passes = Game_scalePasses(game);
+	if (!passes || !game->completed_pixels || game->scale2x_failed)
+		return game->texture;
+	int width = game->width << passes, height = game->height << passes;
+	if (game->scale2x_texture && (game->scale2x_width != width || game->scale2x_height != height)) {
+		XGL_DestroyTexture(game->scale2x_texture);
+		game->scale2x_texture = NULL;
+	}
+	if (!game->scale2x_texture) {
+		Uint32 format;
+		if (XGL_QueryTexture(game->texture, &format, NULL, NULL, NULL) != 0) goto fail;
+		game->scale2x_texture = XGL_CreateTexture(app.xgl.renderers[source], format,
+			XGL_TEXTUREACCESS_STREAMING, width, height);
+		if (!game->scale2x_texture) goto fail;
+		game->scale2x_width = width;
+		game->scale2x_height = height;
+		XGL_SetTextureProfileScreen(game->scale2x_texture, source);
+	}
+	void *pixels;
+	int pitch;
+	if (XGL_LockTexture(game->scale2x_texture, NULL, &pixels, &pitch) != 0) goto fail;
+	if (Game_filterCopy(game, pixels, pitch) != 0) {
+		XGL_UnlockTextureDiscard(game->scale2x_texture);
+		goto fail;
+	}
+	XGL_UnlockTexture(game->scale2x_texture);
+	return game->scale2x_texture;
+fail:
+	game->scale2x_failed = 1;
+	SDL_Log("Scale2x: screen %d XGL texture unavailable; using native image: %s", source, SDL_GetError());
+	return game->texture;
+}
+
 static void App_render(void) {
 	if (idling) {
 		real_SDL_Delay(1); // drastic paces itself
@@ -5345,12 +5554,13 @@ static void App_render(void) {
 		Uint64 draw_started = AVProfile_now(&av_profile);
 		XGL_Renderer *renderer = app.xgl.renderers[i];
 		int source = i ^ app.screen_swap;
+		XGL_Texture *game_texture = Game_displayTexture(source);
 		int fused = settings.grid && use_fused_grid &&
 			XGL_SetShaderGrid(app.xgl.game_shaders[i], app.xgl.grid) == 0 && app.xgl.grid;
 		app.xgl.fused_grid_last[i] = fused;
 		Uint64 screen_started = av_profile.detail ? AVProfile_now(&av_profile) : 0;
 		XGL_SetRenderShader(renderer, app.xgl.game_shaders[i]);
-		XGL_RenderCopy(renderer, app.xgl.screens[source], NULL, NULL);
+		XGL_RenderCopy(renderer, game_texture, NULL, NULL);
 		XGL_SetShaderGrid(app.xgl.game_shaders[i], NULL);
 		if (av_profile.detail) {
 			AVProfile_end(&av_profile, AV_DRAW_TOP + i, screen_started);
@@ -5592,6 +5802,7 @@ SDL_Texture *SDL_CreateTexture(SDL_Renderer *renderer, Uint32 format, int type, 
 					app.xgl.game_rgba_upload[i] ? SDL_PIXELFORMAT_ABGR8888 : format,
 					XGL_TEXTUREACCESS_STREAMING, w, h);
 				if (!texture) return NULL;
+				Game_resetScale2x(dummy);
 				XGL_DestroyTexture(dummy->texture);
 				dummy->completed_pixels = NULL;
 				dummy->pixel_base = NULL;
@@ -6000,6 +6211,8 @@ static int override_args(int argc, char **argv, char **envp) {
 	hook();
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+	const char *logging = getenv("DRASTIC_LOG");
+	if (!logging || strcmp(logging, "1")) SDL_LogSetAllPriority(SDL_LOG_PRIORITY_CRITICAL);
 	const char *profile = getenv("DRASTIC_PROFILE");
 	int level = profile && !strcmp(profile, "2") ? 2 : profile && !strcmp(profile, "1") ? 1 : 0;
 	AVProfile_init(&av_profile, level);
@@ -6040,7 +6253,7 @@ static int override_args(int argc, char **argv, char **envp) {
 		av_profile.cpu_available ? "available" : "unavailable");
 	if (hw_probe_mode) SDL_Log("AV hardware probe: enabled (five-second interval)");
 	App_boot();
-	if (!Config_set_hires_3d(settings.display_mode == DISPLAY_HIRES))
+	if (!Config_set_hires_3d(DisplayMode_isHires(settings.display_mode)))
 		SDL_Log("Could not synchronize Hi-Res configuration");
 	char *new_argv[] = { argv[0], app.game_path, NULL };
 	

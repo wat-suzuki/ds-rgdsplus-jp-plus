@@ -10,13 +10,14 @@ FONT_PATH = ROOT / 'fonts/NotoSansJP-Bold.ttf'
 SIZE = (1024, 768)
 
 
-def save_top_down_bmp(image: Image.Image, path: Path) -> None:
+def save_bmp(image: Image.Image, path: Path) -> None:
     image = image.convert('RGB')
     width, height = image.size
     stride = (width * 3 + 3) & ~3
     rgb = image.tobytes()
     pixels = bytearray()
-    for y in range(height):
+    # The boot splash loader needs bottom-up BMP rows and a positive height.
+    for y in range(height - 1, -1, -1):
         row = rgb[y * width * 3:(y + 1) * width * 3]
         bgr = bytearray(len(row))
         bgr[0::3], bgr[1::3], bgr[2::3] = row[2::3], row[1::3], row[0::3]
@@ -24,7 +25,7 @@ def save_top_down_bmp(image: Image.Image, path: Path) -> None:
         pixels.extend(b'\0' * (stride - len(bgr)))
     offset = 54
     header = struct.pack('<2sIHHI', b'BM', offset + len(pixels), 0, 0, offset)
-    dib = struct.pack('<IiiHHIIiiII', 40, width, -height, 1, 24, 0,
+    dib = struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0,
                       len(pixels), 2834, 2834, 0, 0)
     path.write_bytes(header + dib + pixels)
 
@@ -42,22 +43,28 @@ def main() -> None:
     label_font = ImageFont.truetype(str(FONT_PATH), 26)
     action_font = ImageFont.truetype(str(FONT_PATH), 38)
 
-    draw_shadowed((20, 18), 'DS RGDSPLUS JP+', brand, (187, 187, 187))
+    draw_shadowed((20, 18), 'monoDS RGDS PLUS', brand, (187, 187, 187))
     draw_shadowed((20, 58), 'CONTROLS', title, (255, 255, 255))
+    # Brightness is the first entry at the top of the right column. Keep the
+    # original first control row below the headings.
+    draw_shadowed((540, 66), 'BRIGHTNESS', label_font, (187, 187, 187))
+    draw_shadowed((540, 100), 'MENU + VOL + / -', action_font, (255, 255, 255))
 
     controls = [
-        ('IN-GAME MENU', 'MENU', 44, 220),
-        ('HI-RES MODE', 'MENU + START', 44, 355),
-        ('SWAP SCREENS', 'MENU + SELECT', 44, 490),
-        ('SYSTEM MENU', 'MENU AGAIN', 540, 220),
-        ('SCREENSHOT', 'MENU + A', 540, 355),
-        ('FAST-FORWARD', 'BACK', 540, 490),
+        ('IN-GAME MENU', 'MENU', 44, 190),
+        ('X2 -> HI-RES', 'MENU + START', 44, 325),
+        ('SWAP SCREENS', 'MENU + SELECT', 44, 460),
+        ('', '', 44, 595),
+        ('SYSTEM MENU', 'MENU AGAIN', 540, 190),
+        ('SCREENSHOT', 'MENU + A', 540, 325),
+        ('FAST-FORWARD', 'BACK', 540, 460),
+        ('SHOW GRID', 'MENU + R2', 540, 595),
     ]
     for label, action, x, y in controls:
         draw_shadowed((x, y), label, label_font, (187, 187, 187))
         draw_shadowed((x, y + 34), action, action_font, (255, 255, 255))
 
-    save_top_down_bmp(image, ROOT / 'skeleton/bootlogo-1.bmp')
+    save_bmp(image, ROOT / 'skeleton/bootlogo-1.bmp')
     image.save(ROOT / 'github/bootlogo-1-preview.png')
 
 
