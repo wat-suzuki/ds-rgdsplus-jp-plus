@@ -14,11 +14,11 @@ This release can boot with either a TF1 card alone or both TF1 and TF2 cards. It
 
 ### x2
 
-x2 (Scale2x) is a display mode intended to improve image quality while preserving the original pixel look and smoothing edges. Its appearance depends on the game and personal preference, so compare it with Original and choose the one you prefer. Example: **Pokémon Ranger**.
+x2 (Scale2x) is a display mode intended to improve image quality while preserving the original pixel look and smoothing edges. Its appearance depends on the game and personal preference, so compare it with Original and choose the one you prefer. Example for comparison: the 2D action game **Kirby: Squeak Squad**.
 
 ### Hi-RES
 
-Hi-RES increases the resolution of 3D rendering. It can improve image quality in 3D-focused games such as **Pokémon Ranger** and **Mario Kart DS**. In 2D-focused games such as **New Super Mario Bros.**, it can look worse than the original rendering. Switch modes per game and choose the display you prefer.
+Hi-RES increases the resolution of 3D rendering. It can improve image quality in 3D-focused games, but in 2D-focused games such as **Kirby: Squeak Squad**, image quality may look worse. Switch modes per game and choose the display you prefer.
 
 ## Differences from DEDICATED OS
 
@@ -30,22 +30,16 @@ Hi-RES increases the resolution of 3D rendering. It can improve image quality in
 
 ### Using TF1 only
 
-1. Download and extract the latest monoDS RG DS PLUS package from [Releases](../../releases).
-2. Copy the package contents to the root of the TF1/INT card.
-3. Put your games in `/games/`, insert the card into the TF1/INT slot, and start the device.
+1. Download `monods-rgdsplus.img.zip` from [Releases](../../releases) and write the image to the TF1/INT card using an image-writing tool.
+2. Insert the card into the TF1/INT slot and start the device.
+3. Store your game data on the `MONODS` disk on the card.
 
 ### Using TF1 and TF2
 
-1. Download the system image from the original [`main-rgds-plus` releases](https://github.com/dedicated-os/main-rgds-plus/releases) and write it to the TF1/INT card, following the [original project instructions](https://github.com/dedicated-os/dedicated-rgds-plus).
-2. Prepare the TF2/EXT card as described by the original project.
-3. Download and extract the latest monoDS RG DS PLUS package from this repository's [Releases](../../releases), then copy its contents to the root of TF2/EXT.
+1. As for a TF1-only setup, write `monods-rgdsplus.img.zip` to the TF1/INT card.
+2. Format a MicroSD card for TF2/EXT as FAT32.
+3. Download and extract `monods-rgdsplus.zip` from [Releases](../../releases), then copy all extracted contents to the root of the TF2/EXT card.
 4. Put your games in `/games/` on TF2/EXT, insert both cards, and start the device.
-
-### Updating
-
-1. Download and extract the latest monoDS RG DS PLUS package from [Releases](../../releases).
-2. Copy `system.zip`, `bootlogo-0.bmp`, and `bootlogo-1.bmp` to the root of the card in use, replacing the existing files (TF1/INT for a TF1-only setup, or TF2/EXT for a two-card setup).
-3. Start the device. The system update is applied during startup.
 
 ## Controls
 
@@ -63,8 +57,6 @@ Press the device's **MENU** button to open the in-game menu. Press it again to o
 ![Boot controls](github/bootlogo-1-preview.png)
 
 `MENU + A` saves both screens together as one 1024×1536 BMP in `userdata/screenshots/`, named with the game title and an increasing serial (for example, `Game Title-0001.bmp`).
-
-Changing Hi-Res mode saves the current game, restarts DraStic, and resumes the game automatically.
 
 ## Credits
 
